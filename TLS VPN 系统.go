@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -9,7 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -17,7 +16,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -312,7 +310,7 @@ func (s *VPNSession) GetActivity() time.Time {
 // VPNServer VPN服务器结构
 type VPNServer struct {
 	listener       net.Listener
-	config         *tls.Config
+	tlsConfig      *tls.Config
 	sessions       map[string]*VPNSession
 	sessionMutex   sync.RWMutex
 	running        bool
@@ -321,7 +319,7 @@ type VPNServer struct {
 	clientIPPool   *IPPool
 	packetHandler  func([]byte) error
 	sessionCount   int64
-	config         VPNConfig
+	vpnConfig      VPNConfig
 }
 
 // NewVPNServer 创建新的VPN服务器
@@ -339,13 +337,13 @@ func NewVPNServer(address string, certManager *CertificateManager, config VPNCon
 
 	return &VPNServer{
 		listener:     listener,
-		config:       serverConfig,
+		tlsConfig:    serverConfig,
 		sessions:     make(map[string]*VPNSession),
 		running:      true,
 		shutdownChan: make(chan struct{}),
 		vpnNetwork:   vpnNetwork,
 		clientIPPool: NewIPPool(vpnNetwork),
-		config:       config,
+		vpnConfig:    config,
 	}, nil
 }
 
@@ -400,8 +398,8 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 	s.sessionMutex.RLock()
 	count := s.sessionCount
 	s.sessionMutex.RUnlock()
-	if count >= int64(s.config.MaxConnections) {
-		log.Printf("连接数已达到上限: %d", s.config.MaxConnections)
+	if count >= int64(s.vpnConfig.MaxConnections) {
+		log.Printf("连接数已达到上限: %d", s.vpnConfig.MaxConnections)
 		return
 	}
 
@@ -570,7 +568,7 @@ func (s *VPNServer) cleanupSessions() {
 	for range ticker.C {
 		s.sessionMutex.Lock()
 		for id, session := range s.sessions {
-			if time.Since(session.GetActivity()) > s.config.SessionTimeout {
+			if time.Since(session.GetActivity()) > s.vpnConfig.SessionTimeout {
 				log.Printf("清理超时会话: %s", id)
 				s.clientIPPool.ReleaseIP(session.IP)
 				delete(s.sessions, id)
@@ -640,7 +638,7 @@ func (p *IPPool) AllocateIP() net.IP {
 func (p *IPPool) ReleaseIP(ip net.IP) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	p.allocated[ip.String()] = false
+	delete(p.allocated, ip.String())
 }
 
 // VPNClient VPN客户端结构
@@ -696,23 +694,22 @@ func (c *VPNClient) Connect() error {
 		return fmt.Errorf("读取消息头失败: %v", err)
 	}
 
-	msg, err := Deserialize(header)
-	if err != nil {
-		return fmt.Errorf("解析消息头失败: %v", err)
-	}
+	// 手动解析消息头
+	msgType := MessageType(header[0])
+	msgLength := binary.BigEndian.Uint32(header[1:5])
 
 	// 读取消息体
-	payload := make([]byte, msg.Length)
+	payload := make([]byte, msgLength)
 	_, err = io.ReadFull(c.conn, payload)
 	if err != nil {
 		return fmt.Errorf("读取消息体失败: %v", err)
 	}
 
-	if msg.Type == MessageTypeIPAssignment && len(payload) >= 4 {
+	if msgType == MessageTypeIPAssignment && len(payload) >= 4 {
 		c.assignedIP = net.IP(payload)
 		log.Printf("分配的VPN IP: %s", c.assignedIP)
 	} else {
-		return fmt.Errorf("未收到有效的IP分配信息: type=%d, length=%d", msg.Type, msg.Length)
+		return fmt.Errorf("未收到有效的IP分配信息: type=%d, length=%d", msgType, msgLength)
 	}
 
 	return nil
