@@ -1,0 +1,8 @@
+# Binaries
+TLS VPN 系统
+*.exe
+*.out
+
+# Go build artifacts
+*.test
+*.prof
