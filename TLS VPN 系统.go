@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -9,7 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -17,7 +16,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -312,7 +310,7 @@ func (s *VPNSession) GetActivity() time.Time {
 // VPNServer VPN服务器结构
 type VPNServer struct {
 	listener       net.Listener
-	config         *tls.Config
+	tlsConfig      *tls.Config
 	sessions       map[string]*VPNSession
 	sessionMutex   sync.RWMutex
 	running        bool
@@ -321,7 +319,7 @@ type VPNServer struct {
 	clientIPPool   *IPPool
 	packetHandler  func([]byte) error
 	sessionCount   int64
-	config         VPNConfig
+	vpnConfig      VPNConfig
 }
 
 // NewVPNServer 创建新的VPN服务器
@@ -339,20 +337,25 @@ func NewVPNServer(address string, certManager *CertificateManager, config VPNCon
 
 	return &VPNServer{
 		listener:     listener,
-		config:       serverConfig,
+		tlsConfig:    serverConfig,
 		sessions:     make(map[string]*VPNSession),
 		running:      true,
 		shutdownChan: make(chan struct{}),
 		vpnNetwork:   vpnNetwork,
 		clientIPPool: NewIPPool(vpnNetwork),
-		config:       config,
+		vpnConfig:    config,
 	}, nil
 }
 
 // Start 启动VPN服务器
 func (s *VPNServer) Start() {
 	log.Printf("VPN服务器启动，监听地址: %s", s.listener.Addr())
-	defer s.listener.Close()
+	defer func() {
+		if err := s.listener.Close(); err != nil {
+			log.Printf("关闭监听器失败: %v", err)
+		}
+		log.Println("VPN服务器已停止")
+	}()
 
 	// 启动会话清理协程
 	go s.cleanupSessions()
@@ -361,6 +364,7 @@ func (s *VPNServer) Start() {
 		conn, err := s.listener.Accept()
 		if err != nil {
 			if !s.running {
+				log.Println("服务器正在停止，不再接受新连接")
 				break
 			}
 			log.Printf("接受连接失败: %v", err)
@@ -369,30 +373,32 @@ func (s *VPNServer) Start() {
 
 		go s.handleConnection(conn)
 	}
-
-	log.Println("VPN服务器已停止")
 }
 
 // handleConnection 处理连接
 func (s *VPNServer) handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("关闭连接失败 %s: %v", conn.RemoteAddr(), err)
+		}
+	}()
 
 	tlsConn, ok := conn.(*tls.Conn)
 	if !ok {
-		log.Printf("非TLS连接被拒绝: %s", conn.RemoteAddr())
+		log.Printf("非TLS连接被拒绝: %s，连接类型不匹配", conn.RemoteAddr())
 		return
 	}
 
 	err := tlsConn.Handshake()
 	if err != nil {
-		log.Printf("TLS握手失败: %v", err)
+		log.Printf("TLS握手失败 (远程地址: %s): %v", conn.RemoteAddr(), err)
 		return
 	}
 
 	// 验证客户端证书
 	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
-		log.Printf("客户端未提供证书: %s", conn.RemoteAddr())
+		log.Printf("客户端未提供证书 (远程地址: %s)，拒绝连接", conn.RemoteAddr())
 		return
 	}
 
@@ -400,8 +406,9 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 	s.sessionMutex.RLock()
 	count := s.sessionCount
 	s.sessionMutex.RUnlock()
-	if count >= int64(s.config.MaxConnections) {
-		log.Printf("连接数已达到上限: %d", s.config.MaxConnections)
+	if count >= int64(s.vpnConfig.MaxConnections) {
+		log.Printf("连接数已达到上限 (当前: %d, 最大: %d)，拒绝连接: %s", 
+			count, s.vpnConfig.MaxConnections, conn.RemoteAddr())
 		return
 	}
 
@@ -412,7 +419,8 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 	// 分配IP地址
 	clientIP := s.clientIPPool.AllocateIP()
 	if clientIP == nil {
-		log.Printf("IP地址池已满: %s", conn.RemoteAddr())
+		log.Printf("IP地址池已满，无法分配IP给客户端: %s (证书: %s)", 
+			conn.RemoteAddr(), certSubject)
 		return
 	}
 
@@ -438,15 +446,17 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 	}
 	ipData, err := ipMsg.Serialize()
 	if err != nil {
-		log.Printf("序列化IP分配消息失败: %v", err)
+		log.Printf("序列化IP分配消息失败 (会话: %s): %v", sessionID, err)
 		s.removeSession(sessionID)
+		s.clientIPPool.ReleaseIP(clientIP)
 		return
 	}
 
 	_, err = tlsConn.Write(ipData)
 	if err != nil {
-		log.Printf("发送IP分配信息失败: %v", err)
+		log.Printf("发送IP分配信息失败 (会话: %s, IP: %s): %v", sessionID, clientIP, err)
 		s.removeSession(sessionID)
+		s.clientIPPool.ReleaseIP(clientIP)
 		return
 	}
 
@@ -457,6 +467,7 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 // handleSessionData 处理会话数据
 func (s *VPNServer) handleSessionData(session *VPNSession) {
 	defer func() {
+		log.Printf("会话数据处理结束，清理会话: %s (IP: %s)", session.ID, session.IP)
 		s.removeSession(session.ID)
 	}()
 
@@ -470,13 +481,17 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// 检查是否超时
 				if time.Since(session.GetActivity()) > 60*time.Second {
-					log.Printf("会话超时: %s", session.ID)
+					log.Printf("会话超时 (会话: %s, IP: %s, 最后活动: %v)", 
+						session.ID, session.IP, session.GetActivity())
 					break
 				}
 				continue // 继续等待数据
 			}
 			if err != io.EOF {
-				log.Printf("读取消息头失败: %v", err)
+				log.Printf("读取消息头失败 (会话: %s, IP: %s): %v", 
+					session.ID, session.IP, err)
+			} else {
+				log.Printf("客户端正常断开连接 (会话: %s, IP: %s)", session.ID, session.IP)
 			}
 			break
 		}
@@ -489,7 +504,8 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 		payload := make([]byte, length)
 		_, err = io.ReadFull(session.TLSConn, payload)
 		if err != nil {
-			log.Printf("读取消息体失败: %v", err)
+			log.Printf("读取消息体失败 (会话: %s, IP: %s, 消息类型: %d, 期望长度: %d): %v", 
+				session.ID, session.IP, msgType, length, err)
 			break
 		}
 
@@ -506,17 +522,19 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 			}
 			responseData, err := response.Serialize()
 			if err != nil {
-				log.Printf("序列化心跳响应失败: %v", err)
+				log.Printf("序列化心跳响应失败 (会话: %s): %v", session.ID, err)
 				continue
 			}
 			_, err = session.TLSConn.Write(responseData)
 			if err != nil {
-				log.Printf("发送心跳响应失败: %v", err)
+				log.Printf("发送心跳响应失败 (会话: %s, IP: %s): %v", 
+					session.ID, session.IP, err)
 				break
 			}
 		case MessageTypeData:
 			// 处理数据包
-			log.Printf("从会话 %s 接收到数据包，长度: %d", session.ID, len(payload))
+			log.Printf("从会话 %s (IP: %s) 接收到数据包，长度: %d", 
+				session.ID, session.IP, len(payload))
 			// 这里可以实现IP包转发逻辑
 			// 回显数据包（实际应用中应转发到目标地址）
 			response := &Message{
@@ -526,20 +544,21 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 			}
 			responseData, err := response.Serialize()
 			if err != nil {
-				log.Printf("序列化数据响应失败: %v", err)
+				log.Printf("序列化数据响应失败 (会话: %s): %v", session.ID, err)
 				continue
 			}
 			_, err = session.TLSConn.Write(responseData)
 			if err != nil {
-				log.Printf("发送数据响应失败: %v", err)
+				log.Printf("发送数据响应失败 (会话: %s, IP: %s): %v", 
+					session.ID, session.IP, err)
 				break
 			}
 		default:
-			log.Printf("收到未知消息类型: %d", msgType)
+			log.Printf("收到未知消息类型 (会话: %s, 类型: %d)", session.ID, msgType)
 		}
 	}
 
-	log.Printf("会话断开: %s", session.ID)
+	log.Printf("会话断开: %s (IP: %s)", session.ID, session.IP)
 }
 
 // addSession 添加会话
@@ -557,7 +576,11 @@ func (s *VPNServer) removeSession(id string) {
 	if session, exists := s.sessions[id]; exists {
 		s.clientIPPool.ReleaseIP(session.IP)
 		delete(s.sessions, id)
-		session.TLSConn.Close()
+		if err := session.TLSConn.Close(); err != nil {
+			log.Printf("关闭会话连接失败 (会话: %s, IP: %s): %v", id, session.IP, err)
+		} else {
+			log.Printf("会话连接已关闭 (会话: %s, IP: %s)", id, session.IP)
+		}
 		s.sessionCount--
 	}
 }
@@ -568,13 +591,21 @@ func (s *VPNServer) cleanupSessions() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		if !s.running {
+			log.Println("服务器已停止，退出会话清理协程")
+			break
+		}
+		
 		s.sessionMutex.Lock()
 		for id, session := range s.sessions {
-			if time.Since(session.GetActivity()) > s.config.SessionTimeout {
-				log.Printf("清理超时会话: %s", id)
+			if time.Since(session.GetActivity()) > s.vpnConfig.SessionTimeout {
+				log.Printf("清理超时会话 (会话: %s, IP: %s, 最后活动: %v)", 
+					id, session.IP, session.GetActivity())
 				s.clientIPPool.ReleaseIP(session.IP)
 				delete(s.sessions, id)
-				session.TLSConn.Close()
+				if err := session.TLSConn.Close(); err != nil {
+					log.Printf("关闭超时会话连接失败 (会话: %s): %v", id, err)
+				}
 				s.sessionCount--
 			}
 		}
@@ -584,17 +615,33 @@ func (s *VPNServer) cleanupSessions() {
 
 // Stop 停止服务器
 func (s *VPNServer) Stop() {
+	log.Println("开始停止VPN服务器...")
 	s.running = false
 	close(s.shutdownChan)
-	s.listener.Close()
+	
+	if err := s.listener.Close(); err != nil {
+		log.Printf("关闭监听器失败: %v", err)
+	} else {
+		log.Println("监听器已关闭")
+	}
 
 	s.sessionMutex.Lock()
+	defer s.sessionMutex.Unlock()
+	
+	sessionCount := len(s.sessions)
+	log.Printf("正在关闭 %d 个活动会话", sessionCount)
+	
 	for id, session := range s.sessions {
-		session.TLSConn.Close()
+		if err := session.TLSConn.Close(); err != nil {
+			log.Printf("关闭会话连接失败 (会话: %s, IP: %s): %v", 
+				id, session.IP, err)
+		} else {
+			log.Printf("会话已关闭 (会话: %s, IP: %s)", id, session.IP)
+		}
 		delete(s.sessions, id)
 	}
 	s.sessionCount = 0
-	s.sessionMutex.Unlock()
+	log.Println("所有会话已关闭，服务器停止完成")
 }
 
 // IPPool IP地址池
@@ -668,22 +715,27 @@ func NewVPNClient(certManager *CertificateManager, config VPNConfig) *VPNClient 
 // Connect 连接到VPN服务器
 func (c *VPNClient) Connect() error {
 	address := fmt.Sprintf("%s:%d", c.config.ServerAddress, c.config.ServerPort)
+	log.Printf("正在连接到VPN服务器: %s", address)
 	
 	conn, err := tls.Dial("tcp", address, c.tlsConfig)
 	if err != nil {
-		return fmt.Errorf("连接失败: %v", err)
+		return fmt.Errorf("连接失败 (地址: %s): %v", address, err)
 	}
 
 	err = conn.Handshake()
 	if err != nil {
-		conn.Close()
-		return fmt.Errorf("TLS握手失败: %v", err)
+		if closeErr := conn.Close(); closeErr != nil {
+			log.Printf("TLS握手失败后关闭连接出错: %v", closeErr)
+		}
+		return fmt.Errorf("TLS握手失败 (地址: %s): %v", address, err)
 	}
 
 	// 验证TLS版本
 	if conn.ConnectionState().Version != tls.VersionTLS13 {
-		conn.Close()
-		return fmt.Errorf("未使用TLS 1.3协议")
+		if closeErr := conn.Close(); closeErr != nil {
+			log.Printf("TLS版本验证失败后关闭连接出错: %v", closeErr)
+		}
+		return fmt.Errorf("未使用TLS 1.3协议 (实际版本: 0x%x)", conn.ConnectionState().Version)
 	}
 
 	c.conn = conn
@@ -693,11 +745,13 @@ func (c *VPNClient) Connect() error {
 	header := make([]byte, 5)
 	_, err = io.ReadFull(c.conn, header)
 	if err != nil {
+		log.Printf("读取IP分配消息头失败: %v", err)
 		return fmt.Errorf("读取消息头失败: %v", err)
 	}
 
 	msg, err := Deserialize(header)
 	if err != nil {
+		log.Printf("解析IP分配消息头失败: %v", err)
 		return fmt.Errorf("解析消息头失败: %v", err)
 	}
 
@@ -705,6 +759,7 @@ func (c *VPNClient) Connect() error {
 	payload := make([]byte, msg.Length)
 	_, err = io.ReadFull(c.conn, payload)
 	if err != nil {
+		log.Printf("读取IP分配消息体失败 (期望长度: %d): %v", msg.Length, err)
 		return fmt.Errorf("读取消息体失败: %v", err)
 	}
 
@@ -712,6 +767,7 @@ func (c *VPNClient) Connect() error {
 		c.assignedIP = net.IP(payload)
 		log.Printf("分配的VPN IP: %s", c.assignedIP)
 	} else {
+		log.Printf("未收到有效的IP分配信息 (类型: %d, 长度: %d)", msg.Type, msg.Length)
 		return fmt.Errorf("未收到有效的IP分配信息: type=%d, length=%d", msg.Type, msg.Length)
 	}
 
@@ -798,7 +854,8 @@ func (c *VPNClient) Run() {
 	for c.running && c.reconnect {
 		err := c.Connect()
 		if err != nil {
-			log.Printf("连接失败: %v，%v秒后重试", err, c.config.ReconnectDelay/time.Second)
+			log.Printf("连接VPN服务器失败: %v，将在 %v 秒后重试", 
+				err, c.config.ReconnectDelay/time.Second)
 			time.Sleep(c.config.ReconnectDelay)
 			continue
 		}
@@ -811,8 +868,17 @@ func (c *VPNClient) Run() {
 		// 数据传输循环
 		c.dataLoop()
 
+		if c.conn != nil {
+			if err := c.conn.Close(); err != nil {
+				log.Printf("关闭客户端连接失败: %v", err)
+			} else {
+				log.Println("客户端连接已关闭")
+			}
+			c.conn = nil
+		}
+
 		if c.reconnect {
-			log.Println("连接断开，尝试重连...")
+			log.Printf("连接断开，将在 %v 秒后尝试重连...", c.config.ReconnectDelay/time.Second)
 			time.Sleep(c.config.ReconnectDelay)
 		}
 	}
@@ -827,30 +893,46 @@ func (c *VPNClient) startHeartbeat() {
 
 	for range ticker.C {
 		if c.conn == nil {
+			log.Println("连接已关闭，停止心跳")
+			break
+		}
+		
+		if !c.running {
+			log.Println("客户端已停止，停止心跳")
 			break
 		}
 		
 		// 发送心跳包
 		err := c.SendHeartbeat()
 		if err != nil {
-			log.Printf("发送心跳失败: %v", err)
+			log.Printf("发送心跳失败: %v，停止心跳", err)
 			break
 		}
 	}
+	log.Println("心跳协程已退出")
 }
 
 // dataLoop 数据传输循环
 func (c *VPNClient) dataLoop() {
 	for c.running {
+		if c.conn == nil {
+			log.Println("连接为空，退出数据循环")
+			break
+		}
+		
 		c.conn.SetReadDeadline(time.Now().Add(c.config.KeepAliveTimeout))
 
 		data, err := c.ReceiveData()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("连接超时")
+				log.Printf("数据接收超时 (超时时间: %v)", c.config.KeepAliveTimeout)
 				break
 			}
-			log.Printf("读取数据失败: %v", err)
+			if err == io.EOF {
+				log.Println("服务器关闭了连接")
+			} else {
+				log.Printf("读取数据失败: %v", err)
+			}
 			break
 		}
 
@@ -858,22 +940,32 @@ func (c *VPNClient) dataLoop() {
 		if data != nil && c.packetHandler != nil {
 			err := c.packetHandler(data)
 			if err != nil {
-				log.Printf("处理数据包失败: %v", err)
+				log.Printf("处理数据包失败 (长度: %d): %v", len(data), err)
 			}
 		} else if data != nil {
 			// 默认处理：打印数据包信息
 			log.Printf("接收到数据包，长度: %d, 内容: %s", len(data), hex.EncodeToString(data[:min(len(data), 16)]))
 		}
 	}
+	log.Println("数据循环结束")
 }
 
 // Close 关闭客户端
 func (c *VPNClient) Close() {
+	log.Println("正在关闭VPN客户端...")
 	c.running = false
 	c.reconnect = false
 	if c.conn != nil {
-		c.conn.Close()
+		if err := c.conn.Close(); err != nil {
+			log.Printf("关闭客户端连接失败: %v", err)
+		} else {
+			log.Println("客户端连接已成功关闭")
+		}
+		c.conn = nil
+	} else {
+		log.Println("客户端连接已经关闭或未建立")
 	}
+	log.Println("VPN客户端关闭完成")
 }
 
 // min 辅助函数
