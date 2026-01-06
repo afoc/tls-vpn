@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -9,7 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -17,7 +16,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -312,7 +310,7 @@ func (s *VPNSession) GetActivity() time.Time {
 // VPNServer VPN服务器结构
 type VPNServer struct {
 	listener       net.Listener
-	config         *tls.Config
+	tlsConfig      *tls.Config
 	sessions       map[string]*VPNSession
 	sessionMutex   sync.RWMutex
 	running        bool
@@ -339,7 +337,7 @@ func NewVPNServer(address string, certManager *CertificateManager, config VPNCon
 
 	return &VPNServer{
 		listener:     listener,
-		config:       serverConfig,
+		tlsConfig:    serverConfig,
 		sessions:     make(map[string]*VPNSession),
 		running:      true,
 		shutdownChan: make(chan struct{}),
@@ -590,6 +588,7 @@ func (s *VPNServer) Stop() {
 
 	s.sessionMutex.Lock()
 	for id, session := range s.sessions {
+		s.clientIPPool.ReleaseIP(session.IP)
 		session.TLSConn.Close()
 		delete(s.sessions, id)
 	}
