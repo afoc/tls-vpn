@@ -124,16 +124,16 @@ func generateCertificatePair(isServer bool, caCert *x509.Certificate, caKey *rsa
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization:  []string{"SecureVPN Organization"},
-			Country:       []string{"CN"},
-			Province:      []string{"Beijing"},
-			Locality:      []string{"Beijing"},
+			Organization: []string{"SecureVPN Organization"},
+			Country:      []string{"CN"},
+			Province:     []string{"Beijing"},
+			Locality:     []string{"Beijing"},
 		},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+		NotBefore:   time.Now(),
+		NotAfter:    time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
 	}
 
 	if isServer {
@@ -309,17 +309,17 @@ func (s *VPNSession) GetActivity() time.Time {
 
 // VPNServer VPN服务器结构
 type VPNServer struct {
-	listener       net.Listener
-	tlsConfig      *tls.Config
-	sessions       map[string]*VPNSession
-	sessionMutex   sync.RWMutex
-	running        bool
-	shutdownChan   chan struct{}
-	vpnNetwork     *net.IPNet
-	clientIPPool   *IPPool
-	packetHandler  func([]byte) error
-	sessionCount   int64
-	vpnConfig      VPNConfig
+	listener      net.Listener
+	tlsConfig     *tls.Config
+	sessions      map[string]*VPNSession
+	sessionMutex  sync.RWMutex
+	running       bool
+	shutdownChan  chan struct{}
+	vpnNetwork    *net.IPNet
+	clientIPPool  *IPPool
+	packetHandler func([]byte) error
+	sessionCount  int64
+	vpnConfig     VPNConfig
 }
 
 // NewVPNServer 创建新的VPN服务器
@@ -407,7 +407,7 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 	count := s.sessionCount
 	s.sessionMutex.RUnlock()
 	if count >= int64(s.vpnConfig.MaxConnections) {
-		log.Printf("连接数已达到上限 (当前: %d, 最大: %d)，拒绝连接: %s", 
+		log.Printf("连接数已达到上限 (当前: %d, 最大: %d)，拒绝连接: %s",
 			count, s.vpnConfig.MaxConnections, conn.RemoteAddr())
 		return
 	}
@@ -419,7 +419,7 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 	// 分配IP地址
 	clientIP := s.clientIPPool.AllocateIP()
 	if clientIP == nil {
-		log.Printf("IP地址池已满，无法分配IP给客户端: %s (证书: %s)", 
+		log.Printf("IP地址池已满，无法分配IP给客户端: %s (证书: %s)",
 			conn.RemoteAddr(), certSubject)
 		return
 	}
@@ -435,7 +435,7 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 	}
 
 	s.addSession(sessionID, session)
-	log.Printf("客户端连接建立: %s (IP: %s, Cert: %s, ID: %s)", 
+	log.Printf("客户端连接建立: %s (IP: %s, Cert: %s, ID: %s)",
 		conn.RemoteAddr(), clientIP, certSubject, sessionID)
 
 	// 发送IP分配信息
@@ -481,14 +481,14 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// 检查是否超时
 				if time.Since(session.GetActivity()) > 60*time.Second {
-					log.Printf("会话超时 (会话: %s, IP: %s, 最后活动: %v)", 
+					log.Printf("会话超时 (会话: %s, IP: %s, 最后活动: %v)",
 						session.ID, session.IP, session.GetActivity())
 					break
 				}
 				continue // 继续等待数据
 			}
 			if err != io.EOF {
-				log.Printf("读取消息头失败 (会话: %s, IP: %s): %v", 
+				log.Printf("读取消息头失败 (会话: %s, IP: %s): %v",
 					session.ID, session.IP, err)
 			} else {
 				log.Printf("客户端正常断开连接 (会话: %s, IP: %s)", session.ID, session.IP)
@@ -504,7 +504,7 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 		payload := make([]byte, length)
 		_, err = io.ReadFull(session.TLSConn, payload)
 		if err != nil {
-			log.Printf("读取消息体失败 (会话: %s, IP: %s, 消息类型: %d, 期望长度: %d): %v", 
+			log.Printf("读取消息体失败 (会话: %s, IP: %s, 消息类型: %d, 期望长度: %d): %v",
 				session.ID, session.IP, msgType, length, err)
 			break
 		}
@@ -527,13 +527,13 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 			}
 			_, err = session.TLSConn.Write(responseData)
 			if err != nil {
-				log.Printf("发送心跳响应失败 (会话: %s, IP: %s): %v", 
+				log.Printf("发送心跳响应失败 (会话: %s, IP: %s): %v",
 					session.ID, session.IP, err)
 				break
 			}
 		case MessageTypeData:
 			// 处理数据包
-			log.Printf("从会话 %s (IP: %s) 接收到数据包，长度: %d", 
+			log.Printf("从会话 %s (IP: %s) 接收到数据包，长度: %d",
 				session.ID, session.IP, len(payload))
 			// 这里可以实现IP包转发逻辑
 			// 回显数据包（实际应用中应转发到目标地址）
@@ -549,7 +549,7 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 			}
 			_, err = session.TLSConn.Write(responseData)
 			if err != nil {
-				log.Printf("发送数据响应失败 (会话: %s, IP: %s): %v", 
+				log.Printf("发送数据响应失败 (会话: %s, IP: %s): %v",
 					session.ID, session.IP, err)
 				break
 			}
@@ -595,11 +595,11 @@ func (s *VPNServer) cleanupSessions() {
 			log.Println("服务器已停止，退出会话清理协程")
 			break
 		}
-		
+
 		s.sessionMutex.Lock()
 		for id, session := range s.sessions {
 			if time.Since(session.GetActivity()) > s.vpnConfig.SessionTimeout {
-				log.Printf("清理超时会话 (会话: %s, IP: %s, 最后活动: %v)", 
+				log.Printf("清理超时会话 (会话: %s, IP: %s, 最后活动: %v)",
 					id, session.IP, session.GetActivity())
 				s.clientIPPool.ReleaseIP(session.IP)
 				delete(s.sessions, id)
@@ -618,7 +618,7 @@ func (s *VPNServer) Stop() {
 	log.Println("开始停止VPN服务器...")
 	s.running = false
 	close(s.shutdownChan)
-	
+
 	if err := s.listener.Close(); err != nil {
 		log.Printf("关闭监听器失败: %v", err)
 	} else {
@@ -627,13 +627,13 @@ func (s *VPNServer) Stop() {
 
 	s.sessionMutex.Lock()
 	defer s.sessionMutex.Unlock()
-	
+
 	sessionCount := len(s.sessions)
 	log.Printf("正在关闭 %d 个活动会话", sessionCount)
-	
+
 	for id, session := range s.sessions {
 		if err := session.TLSConn.Close(); err != nil {
-			log.Printf("关闭会话连接失败 (会话: %s, IP: %s): %v", 
+			log.Printf("关闭会话连接失败 (会话: %s, IP: %s): %v",
 				id, session.IP, err)
 		} else {
 			log.Printf("会话已关闭 (会话: %s, IP: %s)", id, session.IP)
@@ -646,9 +646,9 @@ func (s *VPNServer) Stop() {
 
 // IPPool IP地址池
 type IPPool struct {
-	network    *net.IPNet
-	allocated  map[string]bool
-	mutex      sync.RWMutex
+	network   *net.IPNet
+	allocated map[string]bool
+	mutex     sync.RWMutex
 }
 
 // NewIPPool 创建IP地址池
@@ -692,12 +692,12 @@ func (p *IPPool) ReleaseIP(ip net.IP) {
 
 // VPNClient VPN客户端结构
 type VPNClient struct {
-	tlsConfig    *tls.Config
-	conn         *tls.Conn
-	assignedIP   net.IP
-	running      bool
-	reconnect    bool
-	config       VPNConfig
+	tlsConfig     *tls.Config
+	conn          *tls.Conn
+	assignedIP    net.IP
+	running       bool
+	reconnect     bool
+	config        VPNConfig
 	packetHandler func([]byte) error
 }
 
@@ -716,7 +716,7 @@ func NewVPNClient(certManager *CertificateManager, config VPNConfig) *VPNClient 
 func (c *VPNClient) Connect() error {
 	address := fmt.Sprintf("%s:%d", c.config.ServerAddress, c.config.ServerPort)
 	log.Printf("正在连接到VPN服务器: %s", address)
-	
+
 	conn, err := tls.Dial("tcp", address, c.tlsConfig)
 	if err != nil {
 		return fmt.Errorf("连接失败 (地址: %s): %v", address, err)
@@ -785,7 +785,7 @@ func (c *VPNClient) SendData(data []byte) error {
 		Length:  uint32(len(data)),
 		Payload: data,
 	}
-	
+
 	serialized, err := msg.Serialize()
 	if err != nil {
 		return fmt.Errorf("序列化消息失败: %v", err)
@@ -806,7 +806,7 @@ func (c *VPNClient) SendHeartbeat() error {
 		Length:  0,
 		Payload: []byte{},
 	}
-	
+
 	serialized, err := msg.Serialize()
 	if err != nil {
 		return fmt.Errorf("序列化心跳消息失败: %v", err)
@@ -854,7 +854,7 @@ func (c *VPNClient) Run() {
 	for c.running && c.reconnect {
 		err := c.Connect()
 		if err != nil {
-			log.Printf("连接VPN服务器失败: %v，将在 %v 秒后重试", 
+			log.Printf("连接VPN服务器失败: %v，将在 %v 秒后重试",
 				err, c.config.ReconnectDelay/time.Second)
 			time.Sleep(c.config.ReconnectDelay)
 			continue
@@ -896,12 +896,12 @@ func (c *VPNClient) startHeartbeat() {
 			log.Println("连接已关闭，停止心跳")
 			break
 		}
-		
+
 		if !c.running {
 			log.Println("客户端已停止，停止心跳")
 			break
 		}
-		
+
 		// 发送心跳包
 		err := c.SendHeartbeat()
 		if err != nil {
@@ -919,7 +919,7 @@ func (c *VPNClient) dataLoop() {
 			log.Println("连接为空，退出数据循环")
 			break
 		}
-		
+
 		c.conn.SetReadDeadline(time.Now().Add(c.config.KeepAliveTimeout))
 
 		data, err := c.ReceiveData()
@@ -1034,6 +1034,3 @@ func main() {
 		log.Println("未知参数，使用 'server' 或 'client'")
 	}
 }
-
-
-
