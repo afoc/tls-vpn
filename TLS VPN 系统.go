@@ -23,32 +23,28 @@ import (
 
 // VPNConfig VPN配置结构
 type VPNConfig struct {
-	ServerAddress     string
-	ServerPort        int
-	ClientAddress     string
-	Network           string
-	MTU               int
-	KeepAliveTimeout  time.Duration
-	ReconnectDelay    time.Duration
-	MaxConnections    int
-	SessionTimeout    time.Duration
-	HeartbeatInterval time.Duration
-	HeartbeatTimeout  time.Duration
+	ServerAddress    string
+	ServerPort       int
+	ClientAddress    string
+	Network          string
+	MTU              int
+	KeepAliveTimeout time.Duration
+	ReconnectDelay   time.Duration
+	MaxConnections   int
+	SessionTimeout   time.Duration
 }
 
 // 默认配置
 var DefaultConfig = VPNConfig{
-	ServerAddress:     "localhost",
-	ServerPort:        8080,
-	ClientAddress:     "10.8.0.2/24",
-	Network:           "10.8.0.0/24",
-	MTU:               1500,
-	KeepAliveTimeout:  60 * time.Second,
-	ReconnectDelay:    5 * time.Second,
-	MaxConnections:    100,
-	SessionTimeout:    5 * time.Minute,
-	HeartbeatInterval: 30 * time.Second,
-	HeartbeatTimeout:  10 * time.Second,
+	ServerAddress:    "localhost",
+	ServerPort:       8080,
+	ClientAddress:    "10.8.0.2/24",
+	Network:          "10.8.0.0/24",
+	MTU:              1500,
+	KeepAliveTimeout: 60 * time.Second,
+	ReconnectDelay:   5 * time.Second,
+	MaxConnections:   100,
+	SessionTimeout:   5 * time.Minute,
 }
 
 // MessageType 消息类型枚举
@@ -592,6 +588,7 @@ func (s *VPNServer) Stop() {
 
 	s.sessionMutex.Lock()
 	for id, session := range s.sessions {
+		s.clientIPPool.ReleaseIP(session.IP)
 		session.TLSConn.Close()
 		delete(s.sessions, id)
 	}
@@ -647,31 +644,23 @@ func (p *IPPool) ReleaseIP(ip net.IP) {
 
 // VPNClient VPN客户端结构
 type VPNClient struct {
-	tlsConfig       *tls.Config
-	conn            *tls.Conn
-	assignedIP      net.IP
-	running         bool
-	reconnect       bool
-	config          VPNConfig
-	packetHandler   func([]byte) error
-	done            chan struct{}
-	heartbeatDone   chan struct{}
-	heartbeatFailed chan struct{}
-	wg              sync.WaitGroup
-	mu              sync.Mutex
+	tlsConfig    *tls.Config
+	conn         *tls.Conn
+	assignedIP   net.IP
+	running      bool
+	reconnect    bool
+	config       VPNConfig
+	packetHandler func([]byte) error
 }
 
 // NewVPNClient 创建新的VPN客户端
 func NewVPNClient(certManager *CertificateManager, config VPNConfig) *VPNClient {
 	return &VPNClient{
-		tlsConfig:       certManager.ClientTLSConfig(),
-		running:         true,
-		reconnect:       true,
-		config:          config,
-		packetHandler:   nil, // 现在使用这个字段
-		done:            make(chan struct{}),
-		heartbeatDone:   make(chan struct{}),
-		heartbeatFailed: make(chan struct{}),
+		tlsConfig:     certManager.ClientTLSConfig(),
+		running:       true,
+		reconnect:     true,
+		config:        config,
+		packetHandler: nil, // 现在使用这个字段
 	}
 }
 
@@ -696,15 +685,12 @@ func (c *VPNClient) Connect() error {
 		return fmt.Errorf("未使用TLS 1.3协议")
 	}
 
-	c.mu.Lock()
 	c.conn = conn
-	c.mu.Unlock()
-	
 	log.Println("成功连接到VPN服务器，使用TLS 1.3协议")
 
 	// 读取分配的IP
 	header := make([]byte, 5)
-	_, err = io.ReadFull(conn, header)
+	_, err = io.ReadFull(c.conn, header)
 	if err != nil {
 		return fmt.Errorf("读取消息头失败: %v", err)
 	}
@@ -716,7 +702,7 @@ func (c *VPNClient) Connect() error {
 
 	// 读取消息体
 	payload := make([]byte, msg.Length)
-	_, err = io.ReadFull(conn, payload)
+	_, err = io.ReadFull(c.conn, payload)
 	if err != nil {
 		return fmt.Errorf("读取消息体失败: %v", err)
 	}
@@ -818,42 +804,14 @@ func (c *VPNClient) Run() {
 
 		log.Println("VPN客户端已连接，开始数据传输...")
 
-		// 重置heartbeatFailed channel（以防之前的信号残留）
-		select {
-		case <-c.heartbeatFailed:
-		default:
-		}
-
 		// 启动心跳协程
 		go c.startHeartbeat()
 
-		// 启动数据循环协程（在单独的协程中）
-		go c.dataLoop()
-
-		// 监听断开信号
-		select {
-		case <-c.done:
-			log.Println("收到退出信号，停止运行")
-			c.mu.Lock()
-			if c.conn != nil {
-				c.conn.Close()
-			}
-			c.mu.Unlock()
-			return
-		case <-c.heartbeatFailed:
-			log.Println("心跳失败，触发重连...")
-			c.mu.Lock()
-			if c.conn != nil {
-				c.conn.Close()
-				c.conn = nil
-			}
-			c.mu.Unlock()
-			// 等待当前的协程退出
-			c.wg.Wait()
-		}
+		// 数据传输循环
+		c.dataLoop()
 
 		if c.reconnect {
-			log.Printf("连接断开，%v秒后重连...", c.config.ReconnectDelay/time.Second)
+			log.Println("连接断开，尝试重连...")
 			time.Sleep(c.config.ReconnectDelay)
 		}
 	}
@@ -863,142 +821,58 @@ func (c *VPNClient) Run() {
 
 // startHeartbeat 开始心跳
 func (c *VPNClient) startHeartbeat() {
-	c.wg.Add(1)
-	defer c.wg.Done()
-
-	ticker := time.NewTicker(c.config.HeartbeatInterval)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	log.Printf("心跳协程启动，间隔: %v", c.config.HeartbeatInterval)
-
-	for {
-		select {
-		case <-c.done:
-			log.Println("心跳协程收到退出信号(done)")
-			return
-		case <-c.heartbeatDone:
-			log.Println("心跳协程收到退出信号(heartbeatDone)")
-			return
-		case <-ticker.C:
-			// 检查连接是否有效
-			c.mu.Lock()
-			conn := c.conn
-			c.mu.Unlock()
-
-			if conn == nil {
-				log.Println("心跳发送失败: 连接未建立")
-				select {
-				case c.heartbeatFailed <- struct{}{}:
-					log.Println("已通知主循环心跳失败")
-				default:
-					log.Println("心跳失败信号已存在，跳过通知")
-				}
-				return
-			}
-
-			// 设置写超时
-			conn.SetWriteDeadline(time.Now().Add(c.config.HeartbeatTimeout))
-
-			// 发送心跳包
-			err := c.SendHeartbeat()
-			if err != nil {
-				log.Printf("发送心跳失败: %v", err)
-				select {
-				case c.heartbeatFailed <- struct{}{}:
-					log.Println("已通知主循环心跳失败")
-				default:
-					log.Println("心跳失败信号已存在，跳过通知")
-				}
-				return
-			}
-
-			log.Println("心跳发送成功")
+	for range ticker.C {
+		if c.conn == nil {
+			break
+		}
+		
+		// 发送心跳包
+		err := c.SendHeartbeat()
+		if err != nil {
+			log.Printf("发送心跳失败: %v", err)
+			break
 		}
 	}
 }
 
 // dataLoop 数据传输循环
 func (c *VPNClient) dataLoop() {
-	c.wg.Add(1)
-	defer c.wg.Done()
-
 	for c.running {
-		select {
-		case <-c.done:
-			log.Println("数据循环收到退出信号")
-			return
-		default:
-			c.mu.Lock()
-			conn := c.conn
-			c.mu.Unlock()
+		c.conn.SetReadDeadline(time.Now().Add(c.config.KeepAliveTimeout))
 
-			if conn == nil {
-				log.Println("连接已断开，退出数据循环")
-				return
+		data, err := c.ReceiveData()
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("连接超时")
+				break
 			}
+			log.Printf("读取数据失败: %v", err)
+			break
+		}
 
-			conn.SetReadDeadline(time.Now().Add(c.config.KeepAliveTimeout))
-
-			data, err := c.ReceiveData()
+		// 如果有数据且有处理器，调用处理器
+		if data != nil && c.packetHandler != nil {
+			err := c.packetHandler(data)
 			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					log.Printf("连接超时")
-					return
-				}
-				log.Printf("读取数据失败: %v", err)
-				return
+				log.Printf("处理数据包失败: %v", err)
 			}
-
-			// 如果有数据且有处理器，调用处理器
-			if data != nil && c.packetHandler != nil {
-				err := c.packetHandler(data)
-				if err != nil {
-					log.Printf("处理数据包失败: %v", err)
-				}
-			} else if data != nil {
-				// 默认处理：打印数据包信息
-				log.Printf("接收到数据包，长度: %d, 内容: %s", len(data), hex.EncodeToString(data[:min(len(data), 16)]))
-			}
+		} else if data != nil {
+			// 默认处理：打印数据包信息
+			log.Printf("接收到数据包，长度: %d, 内容: %s", len(data), hex.EncodeToString(data[:min(len(data), 16)]))
 		}
 	}
 }
 
 // Close 关闭客户端
 func (c *VPNClient) Close() {
-	log.Println("开始关闭客户端...")
-	
 	c.running = false
 	c.reconnect = false
-
-	// 关闭done channel以通知所有协程退出
-	select {
-	case <-c.done:
-		// 已经关闭
-	default:
-		close(c.done)
-	}
-
-	// 关闭heartbeatDone channel以通知心跳协程退出
-	select {
-	case <-c.heartbeatDone:
-		// 已经关闭
-	default:
-		close(c.heartbeatDone)
-	}
-
-	// 关闭连接
-	c.mu.Lock()
 	if c.conn != nil {
 		c.conn.Close()
-		c.conn = nil
 	}
-	c.mu.Unlock()
-
-	// 等待所有协程退出
-	log.Println("等待所有协程退出...")
-	c.wg.Wait()
-	
-	log.Println("客户端已完全关闭")
 }
 
 // min 辅助函数
