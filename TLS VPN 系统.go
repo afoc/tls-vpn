@@ -34,6 +34,38 @@ type VPNConfig struct {
 	SessionTimeout   time.Duration
 }
 
+// ValidateConfig 验证配置
+func (c *VPNConfig) ValidateConfig() error {
+	if c.ServerAddress == "" {
+		return fmt.Errorf("服务器地址不能为空")
+	}
+	if c.ServerPort < 1 || c.ServerPort > 65535 {
+		return fmt.Errorf("服务器端口必须在1-65535之间")
+	}
+	if c.Network == "" {
+		return fmt.Errorf("VPN网络不能为空")
+	}
+	if _, _, err := net.ParseCIDR(c.Network); err != nil {
+		return fmt.Errorf("VPN网络格式无效: %v", err)
+	}
+	if c.MTU < 576 || c.MTU > 9000 {
+		return fmt.Errorf("MTU必须在576-9000之间")
+	}
+	if c.KeepAliveTimeout < 10*time.Second {
+		return fmt.Errorf("保活超时不能小于10秒")
+	}
+	if c.ReconnectDelay < 1*time.Second {
+		return fmt.Errorf("重连延迟不能小于1秒")
+	}
+	if c.MaxConnections < 1 || c.MaxConnections > 10000 {
+		return fmt.Errorf("最大连接数必须在1-10000之间")
+	}
+	if c.SessionTimeout < 30*time.Second {
+		return fmt.Errorf("会话超时不能小于30秒")
+	}
+	return nil
+}
+
 // 默认配置
 var DefaultConfig = VPNConfig{
 	ServerAddress:    "localhost",
@@ -108,8 +140,58 @@ type CertificateManager struct {
 	caCert     *x509.Certificate
 }
 
-// generateCertificatePair 生成证书对
+// generateCACertificate 生成CA证书
+func generateCACertificate() ([]byte, []byte, *x509.Certificate, *rsa.PrivateKey, error) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("生成CA私钥失败: %v", err)
+	}
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("生成CA序列号失败: %v", err)
+	}
+
+	caTemplate := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"SecureVPN Organization"},
+			Country:      []string{"CN"},
+			Province:     []string{"Beijing"},
+			Locality:     []string{"Beijing"},
+			CommonName:   "VPN-CA",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years for CA
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+
+	caCertBytes, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("生成CA证书失败: %v", err)
+	}
+
+	caCert, err := x509.ParseCertificate(caCertBytes)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("解析CA证书失败: %v", err)
+	}
+
+	caCertPEM := pemEncode("CERTIFICATE", caCertBytes)
+	caKeyPEM := pemEncode("RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(privateKey))
+
+	return caCertPEM, caKeyPEM, caCert, privateKey, nil
+}
+
+// generateCertificatePair 生成由CA签名的证书对
 func generateCertificatePair(isServer bool, caCert *x509.Certificate, caKey *rsa.PrivateKey) ([]byte, []byte, error) {
+	if caCert == nil || caKey == nil {
+		return nil, nil, fmt.Errorf("CA证书和私钥不能为空")
+	}
+
 	privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
 		return nil, nil, fmt.Errorf("生成私钥失败: %v", err)
@@ -124,53 +206,27 @@ func generateCertificatePair(isServer bool, caCert *x509.Certificate, caKey *rsa
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization:  []string{"SecureVPN Organization"},
-			Country:       []string{"CN"},
-			Province:      []string{"Beijing"},
-			Locality:      []string{"Beijing"},
+			Organization: []string{"SecureVPN Organization"},
+			Country:      []string{"CN"},
+			Province:     []string{"Beijing"},
+			Locality:     []string{"Beijing"},
 		},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+		NotBefore:   time.Now(),
+		NotAfter:    time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
 	}
 
 	if isServer {
 		template.Subject.CommonName = "vpn-server"
 		template.DNSNames = []string{"localhost", "vpn-server"}
 		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
-		template.KeyUsage |= x509.KeyUsageCertSign
 	} else {
 		template.Subject.CommonName = "vpn-client"
 		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
 	}
 
-	var parentCert *x509.Certificate
-	var signingKey interface{}
-	if caCert == nil {
-		// 生成自签名CA
-		caTemplate := template
-		caTemplate.IsCA = true
-		caTemplate.KeyUsage |= x509.KeyUsageCertSign
-		caTemplate.Subject.CommonName = "VPN-CA"
-		caCertBytes, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &privateKey.PublicKey, privateKey)
-		if err != nil {
-			return nil, nil, fmt.Errorf("生成CA证书失败: %v", err)
-		}
-		caCert, err = x509.ParseCertificate(caCertBytes)
-		if err != nil {
-			return nil, nil, fmt.Errorf("解析CA证书失败: %v", err)
-		}
-		signingKey = privateKey
-		parentCert = caCert
-	} else {
-		// 使用现有CA签名
-		signingKey = caKey
-		parentCert = caCert
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, parentCert, &privateKey.PublicKey, signingKey)
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, caCert, &privateKey.PublicKey, caKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("生成证书失败: %v", err)
 	}
@@ -192,41 +248,21 @@ func pemEncode(blockType string, data []byte) []byte {
 // NewCertificateManager 创建证书管理器
 func NewCertificateManager() (*CertificateManager, error) {
 	// 首先生成CA证书
-	caCertPEM, caKeyPEM, err := generateCertificatePair(true, nil, nil)
+	caCertPEM, _, caCert, caKey, err := generateCACertificate()
 	if err != nil {
-		return nil, err
-	}
-
-	// 修复CA证书解析问题 - 使用pem.Decode
-	caCertBlock, _ := pem.Decode(caCertPEM)
-	if caCertBlock == nil {
-		return nil, fmt.Errorf("无法解码CA证书PEM块")
-	}
-	caCert, err := x509.ParseCertificate(caCertBlock.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("解析CA证书失败: %v", err)
-	}
-
-	// 修复CA私钥解析问题 - 使用pem.Decode
-	caKeyBlock, _ := pem.Decode(caKeyPEM)
-	if caKeyBlock == nil {
-		return nil, fmt.Errorf("无法解码CA私钥PEM块")
-	}
-	caKey, err := x509.ParsePKCS1PrivateKey(caKeyBlock.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("解析CA私钥失败: %v", err)
+		return nil, fmt.Errorf("生成CA证书失败: %v", err)
 	}
 
 	// 生成服务器证书
 	serverCertPEM, serverKeyPEM, err := generateCertificatePair(true, caCert, caKey)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("生成服务器证书失败: %v", err)
 	}
 
 	// 生成客户端证书
 	clientCertPEM, clientKeyPEM, err := generateCertificatePair(false, caCert, caKey)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("生成客户端证书失败: %v", err)
 	}
 
 	// 创建服务器证书对
@@ -290,6 +326,7 @@ type VPNSession struct {
 	LastActivity time.Time
 	IP           net.IP
 	CertSubject  string // 证书主题，用于绑定IP
+	closed       bool   // 标记会话是否已关闭
 	mutex        sync.RWMutex
 }
 
@@ -305,6 +342,27 @@ func (s *VPNSession) GetActivity() time.Time {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 	return s.LastActivity
+}
+
+// IsClosed 检查会话是否已关闭
+func (s *VPNSession) IsClosed() bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.closed
+}
+
+// Close 关闭会话连接
+func (s *VPNSession) Close() error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.closed {
+		return nil // 已经关闭
+	}
+	s.closed = true
+	if s.TLSConn != nil {
+		return s.TLSConn.Close()
+	}
+	return nil
 }
 
 // VPNServer VPN服务器结构
@@ -324,6 +382,11 @@ type VPNServer struct {
 
 // NewVPNServer 创建新的VPN服务器
 func NewVPNServer(address string, certManager *CertificateManager, config VPNConfig) (*VPNServer, error) {
+	// 验证配置
+	if err := config.ValidateConfig(); err != nil {
+		return nil, fmt.Errorf("配置验证失败: %v", err)
+	}
+
 	serverConfig := certManager.ServerTLSConfig()
 	listener, err := tls.Listen("tcp", address, serverConfig)
 	if err != nil {
@@ -455,10 +518,13 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 // handleSessionData 处理会话数据
 func (s *VPNServer) handleSessionData(session *VPNSession) {
 	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("会话 %s 处理发生panic: %v", session.ID, r)
+		}
 		s.removeSession(session.ID)
 	}()
 
-	for s.running {
+	for s.running && !session.IsClosed() {
 		session.TLSConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 		// 读取消息头（5字节：类型+长度）
@@ -474,7 +540,7 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 				continue // 继续等待数据
 			}
 			if err != io.EOF {
-				log.Printf("读取消息头失败: %v", err)
+				log.Printf("会话 %s 读取消息头失败: %v", session.ID, err)
 			}
 			break
 		}
@@ -483,12 +549,20 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 		msgType := MessageType(header[0])
 		length := binary.BigEndian.Uint32(header[1:])
 
+		// 防止过大的消息
+		if length > 65535 {
+			log.Printf("会话 %s 消息过大: %d 字节", session.ID, length)
+			break
+		}
+
 		// 读取消息体
 		payload := make([]byte, length)
-		_, err = io.ReadFull(session.TLSConn, payload)
-		if err != nil {
-			log.Printf("读取消息体失败: %v", err)
-			break
+		if length > 0 {
+			_, err = io.ReadFull(session.TLSConn, payload)
+			if err != nil {
+				log.Printf("会话 %s 读取消息体失败: %v", session.ID, err)
+				break
+			}
 		}
 
 		session.UpdateActivity()
@@ -497,19 +571,8 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 		switch msgType {
 		case MessageTypeHeartbeat:
 			// 响应心跳
-			response := &Message{
-				Type:    MessageTypeHeartbeat,
-				Length:  0,
-				Payload: []byte{},
-			}
-			responseData, err := response.Serialize()
-			if err != nil {
-				log.Printf("序列化心跳响应失败: %v", err)
-				continue
-			}
-			_, err = session.TLSConn.Write(responseData)
-			if err != nil {
-				log.Printf("发送心跳响应失败: %v", err)
+			if err := s.sendHeartbeatResponse(session); err != nil {
+				log.Printf("会话 %s 发送心跳响应失败: %v", session.ID, err)
 				break
 			}
 		case MessageTypeData:
@@ -517,27 +580,47 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 			log.Printf("从会话 %s 接收到数据包，长度: %d", session.ID, len(payload))
 			// 这里可以实现IP包转发逻辑
 			// 回显数据包（实际应用中应转发到目标地址）
-			response := &Message{
-				Type:    MessageTypeData,
-				Length:  uint32(len(payload)),
-				Payload: payload,
-			}
-			responseData, err := response.Serialize()
-			if err != nil {
-				log.Printf("序列化数据响应失败: %v", err)
+			if err := s.sendDataResponse(session, payload); err != nil {
+				log.Printf("会话 %s 发送数据响应失败: %v", session.ID, err)
+				// 不要因为单个错误就断开连接，继续处理
 				continue
 			}
-			_, err = session.TLSConn.Write(responseData)
-			if err != nil {
-				log.Printf("发送数据响应失败: %v", err)
-				break
-			}
 		default:
-			log.Printf("收到未知消息类型: %d", msgType)
+			log.Printf("会话 %s 收到未知消息类型: %d", session.ID, msgType)
 		}
 	}
 
 	log.Printf("会话断开: %s", session.ID)
+}
+
+// sendHeartbeatResponse 发送心跳响应
+func (s *VPNServer) sendHeartbeatResponse(session *VPNSession) error {
+	response := &Message{
+		Type:    MessageTypeHeartbeat,
+		Length:  0,
+		Payload: []byte{},
+	}
+	responseData, err := response.Serialize()
+	if err != nil {
+		return fmt.Errorf("序列化心跳响应失败: %v", err)
+	}
+	_, err = session.TLSConn.Write(responseData)
+	return err
+}
+
+// sendDataResponse 发送数据响应
+func (s *VPNServer) sendDataResponse(session *VPNSession, payload []byte) error {
+	response := &Message{
+		Type:    MessageTypeData,
+		Length:  uint32(len(payload)),
+		Payload: payload,
+	}
+	responseData, err := response.Serialize()
+	if err != nil {
+		return fmt.Errorf("序列化数据响应失败: %v", err)
+	}
+	_, err = session.TLSConn.Write(responseData)
+	return err
 }
 
 // addSession 添加会话
@@ -551,12 +634,17 @@ func (s *VPNServer) addSession(id string, session *VPNSession) {
 // removeSession 移除会话
 func (s *VPNServer) removeSession(id string) {
 	s.sessionMutex.Lock()
-	defer s.sessionMutex.Unlock()
-	if session, exists := s.sessions[id]; exists {
+	session, exists := s.sessions[id]
+	if exists {
 		s.clientIPPool.ReleaseIP(session.IP)
 		delete(s.sessions, id)
-		session.TLSConn.Close()
 		s.sessionCount--
+	}
+	s.sessionMutex.Unlock()
+	
+	// 在锁外部关闭连接，避免死锁
+	if exists && session != nil {
+		session.Close()
 	}
 }
 
@@ -566,17 +654,25 @@ func (s *VPNServer) cleanupSessions() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		s.sessionMutex.Lock()
+		if !s.running {
+			break
+		}
+		
+		// 收集需要清理的会话ID
+		var toCleanup []string
+		s.sessionMutex.RLock()
 		for id, session := range s.sessions {
 			if time.Since(session.GetActivity()) > s.config.SessionTimeout {
-				log.Printf("清理超时会话: %s", id)
-				s.clientIPPool.ReleaseIP(session.IP)
-				delete(s.sessions, id)
-				session.TLSConn.Close()
-				s.sessionCount--
+				toCleanup = append(toCleanup, id)
 			}
 		}
-		s.sessionMutex.Unlock()
+		s.sessionMutex.RUnlock()
+
+		// 释放锁后再清理会话
+		for _, id := range toCleanup {
+			log.Printf("清理超时会话: %s", id)
+			s.removeSession(id)
+		}
 	}
 }
 
@@ -586,14 +682,18 @@ func (s *VPNServer) Stop() {
 	close(s.shutdownChan)
 	s.listener.Close()
 
+	// 收集所有会话ID
 	s.sessionMutex.Lock()
-	for id, session := range s.sessions {
-		s.clientIPPool.ReleaseIP(session.IP)
-		session.TLSConn.Close()
-		delete(s.sessions, id)
+	sessionIDs := make([]string, 0, len(s.sessions))
+	for id := range s.sessions {
+		sessionIDs = append(sessionIDs, id)
 	}
-	s.sessionCount = 0
 	s.sessionMutex.Unlock()
+
+	// 在锁外部关闭所有会话
+	for _, id := range sessionIDs {
+		s.removeSession(id)
+	}
 }
 
 // IPPool IP地址池
@@ -639,18 +739,20 @@ func (p *IPPool) AllocateIP() net.IP {
 func (p *IPPool) ReleaseIP(ip net.IP) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	p.allocated[ip.String()] = false
+	delete(p.allocated, ip.String())
 }
 
 // VPNClient VPN客户端结构
 type VPNClient struct {
-	tlsConfig    *tls.Config
-	conn         *tls.Conn
-	assignedIP   net.IP
-	running      bool
-	reconnect    bool
-	config       VPNConfig
-	packetHandler func([]byte) error
+	tlsConfig      *tls.Config
+	conn           *tls.Conn
+	assignedIP     net.IP
+	running        bool
+	reconnect      bool
+	config         VPNConfig
+	packetHandler  func([]byte) error
+	heartbeatStop  chan struct{}
+	heartbeatMutex sync.Mutex
 }
 
 // NewVPNClient 创建新的VPN客户端
@@ -688,30 +790,29 @@ func (c *VPNClient) Connect() error {
 	c.conn = conn
 	log.Println("成功连接到VPN服务器，使用TLS 1.3协议")
 
-	// 读取分配的IP
+	// 读取分配的IP - 先读取消息头，手动解析
 	header := make([]byte, 5)
 	_, err = io.ReadFull(c.conn, header)
 	if err != nil {
 		return fmt.Errorf("读取消息头失败: %v", err)
 	}
 
-	msg, err := Deserialize(header)
-	if err != nil {
-		return fmt.Errorf("解析消息头失败: %v", err)
-	}
+	// 手动解析消息头
+	msgType := MessageType(header[0])
+	length := binary.BigEndian.Uint32(header[1:5])
 
 	// 读取消息体
-	payload := make([]byte, msg.Length)
+	payload := make([]byte, length)
 	_, err = io.ReadFull(c.conn, payload)
 	if err != nil {
 		return fmt.Errorf("读取消息体失败: %v", err)
 	}
 
-	if msg.Type == MessageTypeIPAssignment && len(payload) >= 4 {
+	if msgType == MessageTypeIPAssignment && len(payload) >= 4 {
 		c.assignedIP = net.IP(payload)
 		log.Printf("分配的VPN IP: %s", c.assignedIP)
 	} else {
-		return fmt.Errorf("未收到有效的IP分配信息: type=%d, length=%d", msg.Type, msg.Length)
+		return fmt.Errorf("未收到有效的IP分配信息: type=%d, length=%d", msgType, length)
 	}
 
 	return nil
@@ -759,37 +860,31 @@ func (c *VPNClient) SendHeartbeat() error {
 	return err
 }
 
-// ReceiveData 接收数据
-func (c *VPNClient) ReceiveData() ([]byte, error) {
+// ReceiveData 接收数据，返回消息类型和数据
+func (c *VPNClient) ReceiveData() (MessageType, []byte, error) {
 	if c.conn == nil {
-		return nil, fmt.Errorf("连接未建立")
+		return 0, nil, fmt.Errorf("连接未建立")
 	}
 
 	// 读取消息头
 	header := make([]byte, 5)
 	_, err := io.ReadFull(c.conn, header)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 
-	msg, err := Deserialize(header)
-	if err != nil {
-		return nil, err
-	}
+	// 手动解析消息头
+	msgType := MessageType(header[0])
+	length := binary.BigEndian.Uint32(header[1:5])
 
 	// 读取消息体
-	payload := make([]byte, msg.Length)
+	payload := make([]byte, length)
 	_, err = io.ReadFull(c.conn, payload)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 
-	// 处理心跳响应
-	if msg.Type == MessageTypeHeartbeat {
-		return nil, nil // 心跳不返回数据
-	}
-
-	return payload, nil
+	return msgType, payload, nil
 }
 
 // Run 运行客户端
@@ -804,11 +899,24 @@ func (c *VPNClient) Run() {
 
 		log.Println("VPN客户端已连接，开始数据传输...")
 
+		// 初始化心跳停止通道
+		c.heartbeatMutex.Lock()
+		c.heartbeatStop = make(chan struct{})
+		c.heartbeatMutex.Unlock()
+
 		// 启动心跳协程
 		go c.startHeartbeat()
 
 		// 数据传输循环
 		c.dataLoop()
+
+		// 停止心跳协程
+		c.heartbeatMutex.Lock()
+		if c.heartbeatStop != nil {
+			close(c.heartbeatStop)
+			c.heartbeatStop = nil
+		}
+		c.heartbeatMutex.Unlock()
 
 		if c.reconnect {
 			log.Println("连接断开，尝试重连...")
@@ -824,16 +932,21 @@ func (c *VPNClient) startHeartbeat() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if c.conn == nil {
-			break
-		}
-		
-		// 发送心跳包
-		err := c.SendHeartbeat()
-		if err != nil {
-			log.Printf("发送心跳失败: %v", err)
-			break
+	for {
+		select {
+		case <-ticker.C:
+			if c.conn == nil {
+				return
+			}
+			
+			// 发送心跳包
+			err := c.SendHeartbeat()
+			if err != nil {
+				log.Printf("发送心跳失败: %v", err)
+				return
+			}
+		case <-c.heartbeatStop:
+			return
 		}
 	}
 }
@@ -843,7 +956,7 @@ func (c *VPNClient) dataLoop() {
 	for c.running {
 		c.conn.SetReadDeadline(time.Now().Add(c.config.KeepAliveTimeout))
 
-		data, err := c.ReceiveData()
+		msgType, data, err := c.ReceiveData()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				log.Printf("连接超时")
@@ -851,6 +964,11 @@ func (c *VPNClient) dataLoop() {
 			}
 			log.Printf("读取数据失败: %v", err)
 			break
+		}
+
+		// 处理心跳响应 - 不打印日志
+		if msgType == MessageTypeHeartbeat {
+			continue
 		}
 
 		// 如果有数据且有处理器，调用处理器
@@ -870,8 +988,18 @@ func (c *VPNClient) dataLoop() {
 func (c *VPNClient) Close() {
 	c.running = false
 	c.reconnect = false
+	
+	// 停止心跳协程
+	c.heartbeatMutex.Lock()
+	if c.heartbeatStop != nil {
+		close(c.heartbeatStop)
+		c.heartbeatStop = nil
+	}
+	c.heartbeatMutex.Unlock()
+	
 	if c.conn != nil {
 		c.conn.Close()
+		c.conn = nil
 	}
 }
 
