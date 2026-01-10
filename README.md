@@ -26,6 +26,8 @@
 - ✅ **NAT 规则自动清理**: 防止规则残留
 
 ### 配置灵活性
+- ✅ **证书持久化**: 自动保存和加载证书，避免重复生成
+- ✅ **配置文件支持**: 支持从 JSON 配置文件加载设置
 - ✅ 可自定义 IP 地址范围（ClientIPStart/ClientIPEnd）
 - ✅ 可配置 DNS 服务器推送
 - ✅ 可配置路由推送
@@ -68,6 +70,31 @@ go build -o vpn "TLS VPN 系统.go"
 
 ## 使用方法
 
+### 首次运行 - 生成配置和证书
+
+首次运行时，建议先生成配置文件：
+
+```bash
+./vpn generate-config
+```
+
+这将创建：
+- `./certs/` 目录及证书文件（ca.pem, server.pem, server-key.pem, client.pem, client-key.pem）
+- `./config.json` 配置文件
+
+您可以编辑 `config.json` 来自定义配置，例如：
+
+```json
+{
+  "server_address": "your-server-address.com",
+  "server_port": 8080,
+  "network": "10.8.0.0/24",
+  "mtu": 1500,
+  "dns_servers": ["8.8.8.8", "8.8.4.4"],
+  "push_routes": ["192.168.1.0/24"]
+}
+```
+
 ### 启动服务器
 
 服务器会创建 `tun0` 设备并配置为 `10.8.0.1/24`：
@@ -78,12 +105,31 @@ sudo ./vpn server
 
 服务器日志示例：
 ```
+2024/01/07 10:00:00 从配置文件加载配置: ./config.json
+2024/01/07 10:00:00 配置文件加载成功
 2024/01/07 10:00:00 初始化证书管理器...
+2024/01/07 10:00:00 从 ./certs 目录加载已有证书
 2024/01/07 10:00:01 创建TUN设备: tun0
 2024/01/07 10:00:01 配置TUN设备 tun0: IP=10.8.0.1/24, MTU=1500
 2024/01/07 10:00:01 已启用IP转发
 2024/01/07 10:00:01 服务器TUN设备已初始化: 10.8.0.1
 2024/01/07 10:00:01 VPN服务器启动，监听地址: [::]:8080
+
+========================================
+请将以下文件复制到客户端的 ./certs 目录：
+  - ca.pem
+  - client.pem
+  - client-key.pem
+========================================
+```
+
+### 复制证书到客户端
+
+将服务器上的证书复制到客户端机器：
+
+```bash
+# 在服务器上
+scp ./certs/ca.pem ./certs/client.pem ./certs/client-key.pem user@client-machine:~/vpn-client/certs/
 ```
 
 ### 启动客户端
@@ -96,7 +142,10 @@ sudo ./vpn client
 
 客户端日志示例：
 ```
+2024/01/07 10:00:10 从配置文件加载配置: ./config.json
+2024/01/07 10:00:10 配置文件加载成功
 2024/01/07 10:00:10 初始化证书管理器...
+2024/01/07 10:00:10 从 ./certs 目录加载已有证书
 2024/01/07 10:00:11 创建TUN设备: tun0
 2024/01/07 10:00:11 客户端TUN设备已创建，等待IP分配...
 2024/01/07 10:00:11 成功连接到VPN服务器，使用TLS 1.3协议
@@ -114,6 +163,45 @@ sudo ./vpn client
 # 优雅关闭
 sudo pkill -SIGTERM vpn
 ```
+
+## 配置说明
+
+### 配置文件 (config.json)
+
+配置文件支持以下选项：
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `server_address` | string | "localhost" | 服务器地址 |
+| `server_port` | int | 8080 | 服务器端口 |
+| `client_address` | string | "10.8.0.2/24" | 客户端地址 |
+| `network` | string | "10.8.0.0/24" | VPN 网络 CIDR |
+| `mtu` | int | 1500 | 最大传输单元 |
+| `keep_alive_timeout_sec` | int | 90 | 保活超时（秒） |
+| `reconnect_delay_sec` | int | 5 | 重连延迟（秒） |
+| `max_connections` | int | 100 | 最大连接数 |
+| `session_timeout_sec` | int | 300 | 会话超时（秒） |
+| `session_cleanup_interval_sec` | int | 30 | 会话清理间隔（秒） |
+| `server_ip` | string | "10.8.0.1/24" | 服务器 VPN IP |
+| `client_ip_start` | int | 2 | 客户端 IP 起始 |
+| `client_ip_end` | int | 254 | 客户端 IP 结束 |
+| `dns_servers` | []string | ["8.8.8.8", "8.8.4.4"] | DNS 服务器列表 |
+| `push_routes` | []string | [] | 推送路由（CIDR 格式） |
+
+### 证书管理
+
+证书文件存储在 `./certs/` 目录下：
+
+- `ca.pem` - CA 证书（需要复制到客户端）
+- `server.pem` - 服务器证书
+- `server-key.pem` - 服务器私钥（仅服务器需要）
+- `client.pem` - 客户端证书（需要复制到客户端）
+- `client-key.pem` - 客户端私钥（需要复制到客户端）
+
+**重要提示**：
+- 证书一旦生成会自动保存，后续运行会自动加载
+- 服务器和客户端必须使用相同的 CA 证书
+- 如需重新生成证书，删除 `./certs/` 目录后重新运行程序
 
 ## 测试
 
