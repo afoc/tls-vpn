@@ -10,9 +10,11 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"math/big"
+	mathrand "math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -26,15 +28,21 @@ import (
 
 // VPNConfig VPN配置结构
 type VPNConfig struct {
-	ServerAddress    string
-	ServerPort       int
-	ClientAddress    string
-	Network          string
-	MTU              int
-	KeepAliveTimeout time.Duration
-	ReconnectDelay   time.Duration
-	MaxConnections   int
-	SessionTimeout   time.Duration
+	ServerAddress          string
+	ServerPort             int
+	ClientAddress          string
+	Network                string
+	MTU                    int
+	KeepAliveTimeout       time.Duration
+	ReconnectDelay         time.Duration
+	MaxConnections         int
+	SessionTimeout         time.Duration
+	SessionCleanupInterval time.Duration // 新增：会话清理间隔
+	ServerIP               string        // 新增：服务器VPN IP (例如 "10.8.0.1/24")
+	ClientIPStart          int           // 新增：客户端IP起始 (默认 2)
+	ClientIPEnd            int           // 新增：客户端IP结束 (默认 254)
+	DNSServers             []string      // 新增：推送给客户端的DNS
+	PushRoutes             []string      // 新增：推送给客户端的路由 (CIDR格式)
 }
 
 // ValidateConfig 验证配置
@@ -66,20 +74,63 @@ func (c *VPNConfig) ValidateConfig() error {
 	if c.SessionTimeout < 30*time.Second {
 		return fmt.Errorf("会话超时不能小于30秒")
 	}
+	if c.SessionCleanupInterval < 10*time.Second {
+		return fmt.Errorf("会话清理间隔不能小于10秒")
+	}
+	if c.ClientIPStart < 2 || c.ClientIPStart > 253 {
+		return fmt.Errorf("客户端IP起始必须在2-253之间")
+	}
+	if c.ClientIPEnd < c.ClientIPStart || c.ClientIPEnd > 254 {
+		return fmt.Errorf("客户端IP结束必须在起始之后且不超过254")
+	}
+	// 验证ServerIP（如果提供）
+	if c.ServerIP != "" {
+		if _, _, err := net.ParseCIDR(c.ServerIP); err != nil {
+			return fmt.Errorf("服务器IP格式无效: %v", err)
+		}
+	}
 	return nil
+}
+
+// ParseServerIP 解析服务器IP配置
+func (c *VPNConfig) ParseServerIP() (net.IP, *net.IPNet, error) {
+	if c.ServerIP == "" {
+		// 如果未指定，使用Network的第一个IP
+		_, network, err := net.ParseCIDR(c.Network)
+		if err != nil {
+			return nil, nil, fmt.Errorf("无效的网络配置: %v", err)
+		}
+		ip := network.IP.To4()
+		if ip == nil {
+			return nil, nil, fmt.Errorf("仅支持IPv4")
+		}
+		serverIP := net.IPv4(ip[0], ip[1], ip[2], 1)
+		return serverIP, network, nil
+	}
+	ip, ipNet, err := net.ParseCIDR(c.ServerIP)
+	if err != nil {
+		return nil, nil, fmt.Errorf("无效的服务器IP: %v", err)
+	}
+	return ip, ipNet, nil
 }
 
 // 默认配置
 var DefaultConfig = VPNConfig{
-	ServerAddress:    "localhost",
-	ServerPort:       8080,
-	ClientAddress:    "10.8.0.2/24",
-	Network:          "10.8.0.0/24",
-	MTU:              1500,
-	KeepAliveTimeout: 90 * time.Second,
-	ReconnectDelay:   5 * time.Second,
-	MaxConnections:   100,
-	SessionTimeout:   5 * time.Minute,
+	ServerAddress:          "localhost",
+	ServerPort:             8080,
+	ClientAddress:          "10.8.0.2/24",
+	Network:                "10.8.0.0/24",
+	MTU:                    1500,
+	KeepAliveTimeout:       90 * time.Second,
+	ReconnectDelay:         5 * time.Second,
+	MaxConnections:         100,
+	SessionTimeout:         5 * time.Minute,
+	SessionCleanupInterval: 30 * time.Second,
+	ServerIP:               "10.8.0.1/24",
+	ClientIPStart:          2,
+	ClientIPEnd:            254,
+	DNSServers:             []string{"8.8.8.8", "8.8.4.4"},
+	PushRoutes:             []string{},
 }
 
 // MessageType 消息类型枚举
@@ -95,38 +146,47 @@ const (
 
 // Message VPN消息结构
 type Message struct {
-	Type    MessageType
-	Length  uint32
-	Payload []byte
+	Type     MessageType
+	Length   uint32
+	Sequence uint32 // 新增：消息序列号
+	Checksum uint32 // 新增：CRC32校验和（可选，0表示不校验）
+	Payload  []byte
 }
 
 // Serialize 序列化消息
 func (m *Message) Serialize() ([]byte, error) {
-	header := make([]byte, 5) // Type(1) + Length(4)
+	// 新格式: Type(1) + Length(4) + Sequence(4) + Checksum(4) + Payload
+	header := make([]byte, 13)
 	header[0] = byte(m.Type)
-	binary.BigEndian.PutUint32(header[1:], m.Length)
+	binary.BigEndian.PutUint32(header[1:5], m.Length)
+	binary.BigEndian.PutUint32(header[5:9], m.Sequence)
+	binary.BigEndian.PutUint32(header[9:13], m.Checksum)
 
 	return append(header, m.Payload...), nil
 }
 
 // Deserialize 反序列化消息
 func Deserialize(data []byte) (*Message, error) {
-	if len(data) < 5 {
+	if len(data) < 13 {
 		return nil, fmt.Errorf("消息长度不足")
 	}
 
 	msgType := MessageType(data[0])
 	length := binary.BigEndian.Uint32(data[1:5])
+	sequence := binary.BigEndian.Uint32(data[5:9])
+	checksum := binary.BigEndian.Uint32(data[9:13])
 
-	if uint32(len(data)) < 5+length {
+	if uint32(len(data)) < 13+length {
 		return nil, fmt.Errorf("消息长度不匹配")
 	}
 
-	payload := data[5 : 5+length]
+	payload := data[13 : 13+length]
 	return &Message{
-		Type:    msgType,
-		Length:  length,
-		Payload: payload,
+		Type:     msgType,
+		Length:   length,
+		Sequence: sequence,
+		Checksum: checksum,
+		Payload:  payload,
 	}, nil
 }
 
@@ -331,6 +391,9 @@ type VPNSession struct {
 	CertSubject  string // 证书主题，用于绑定IP
 	closed       bool   // 标记会话是否已关闭
 	mutex        sync.RWMutex
+	sendSeq      uint32      // 新增：发送序列号
+	recvSeq      uint32      // 新增：接收序列号
+	seqMutex     sync.Mutex  // 新增：序列号锁
 }
 
 // UpdateActivity 更新活动时间
@@ -368,11 +431,19 @@ func (s *VPNSession) Close() error {
 	return nil
 }
 
+// NATRule NAT规则记录
+type NATRule struct {
+	Table string   // "nat"
+	Chain string   // "POSTROUTING"
+	Args  []string // 规则参数
+}
+
 // VPNServer VPN服务器结构
 type VPNServer struct {
 	listener       net.Listener
 	tlsConfig      *tls.Config
 	sessions       map[string]*VPNSession
+	ipToSession    map[string]*VPNSession // 新增：IP到会话的快速映射
 	sessionMutex   sync.RWMutex
 	running        bool
 	shutdownChan   chan struct{}
@@ -383,6 +454,7 @@ type VPNServer struct {
 	config         VPNConfig
 	tunDevice      *water.Interface
 	serverIP       net.IP
+	natRules       []NATRule // 新增：NAT规则跟踪
 }
 
 // NewVPNServer 创建新的VPN服务器
@@ -407,12 +479,14 @@ func NewVPNServer(address string, certManager *CertificateManager, config VPNCon
 		listener:     listener,
 		tlsConfig:    serverConfig,
 		sessions:     make(map[string]*VPNSession),
+		ipToSession:  make(map[string]*VPNSession), // 初始化IP映射
 		running:      true,
 		shutdownChan: make(chan struct{}),
 		vpnNetwork:   vpnNetwork,
-		clientIPPool: NewIPPool(vpnNetwork),
+		clientIPPool: NewIPPool(vpnNetwork, &config),
 		config:       config,
 		serverIP:     vpnNetwork.IP.To4(),
+		natRules:     make([]NATRule, 0), // 初始化NAT规则列表
 	}, nil
 }
 
@@ -522,7 +596,11 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 		return
 	}
 
-	sessionID := fmt.Sprintf("%s_%d", conn.RemoteAddr(), time.Now().UnixNano())
+	// 生成唯一的SessionID (使用纳秒时间戳 + 随机数)
+	sessionID := fmt.Sprintf("%s-%d-%d", 
+		conn.RemoteAddr().String(), 
+		time.Now().UnixNano(), 
+		mathrand.Int31())
 	session := &VPNSession{
 		ID:           sessionID,
 		RemoteAddr:   conn.RemoteAddr(),
@@ -530,6 +608,8 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 		LastActivity: time.Now(),
 		IP:           clientIP,
 		CertSubject:  certSubject,
+		sendSeq:      0, // 初始化序列号
+		recvSeq:      0,
 	}
 
 	s.addSession(sessionID, session)
@@ -538,9 +618,11 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 
 	// 发送IP分配信息
 	ipMsg := &Message{
-		Type:    MessageTypeIPAssignment,
-		Length:  uint32(len(clientIP)),
-		Payload: clientIP,
+		Type:     MessageTypeIPAssignment,
+		Length:   uint32(len(clientIP)),
+		Sequence: 0, // IP分配消息不使用序列号
+		Checksum: 0,
+		Payload:  clientIP,
 	}
 	ipData, err := ipMsg.Serialize()
 	if err != nil {
@@ -567,13 +649,14 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 			log.Printf("会话 %s 处理发生panic: %v", session.ID, r)
 		}
 		s.removeSession(session.ID)
+		log.Printf("会话 %s 已清理，IP %s 已回收", session.ID, session.IP)
 	}()
 
 	for s.running && !session.IsClosed() {
 		session.TLSConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-		// 读取消息头（5字节：类型+长度）
-		header := make([]byte, 5)
+		// 读取消息头（13字节：类型+长度+序列号+校验和）
+		header := make([]byte, 13)
 		_, err := io.ReadFull(session.TLSConn, header)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -592,7 +675,9 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 
 		// 解析消息头
 		msgType := MessageType(header[0])
-		length := binary.BigEndian.Uint32(header[1:])
+		length := binary.BigEndian.Uint32(header[1:5])
+		sequence := binary.BigEndian.Uint32(header[5:9])
+		checksum := binary.BigEndian.Uint32(header[9:13])
 
 		// 防止过大的消息
 		if length > 65535 {
@@ -606,6 +691,35 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 			_, err = io.ReadFull(session.TLSConn, payload)
 			if err != nil {
 				log.Printf("会话 %s 读取消息体失败: %v", session.ID, err)
+				break
+			}
+		}
+
+		// 验证序列号（心跳消息除外）
+		if msgType != MessageTypeHeartbeat && msgType != MessageTypeIPAssignment {
+			session.seqMutex.Lock()
+			// 检测重放攻击（序列号回退）
+			if sequence < session.recvSeq {
+				session.seqMutex.Unlock()
+				log.Printf("会话 %s 检测到重放攻击：期望序列号 >= %d，收到 %d", 
+					session.ID, session.recvSeq, sequence)
+				break
+			}
+			// 检测消息丢失（序列号跳跃）
+			if sequence > session.recvSeq+1 && session.recvSeq > 0 {
+				log.Printf("警告：会话 %s 检测到消息丢失，期望序列号 %d，收到 %d", 
+					session.ID, session.recvSeq+1, sequence)
+			}
+			session.recvSeq = sequence
+			session.seqMutex.Unlock()
+		}
+
+		// 验证校验和（如果提供）
+		if checksum != 0 && len(payload) > 0 {
+			actualChecksum := crc32.ChecksumIEEE(payload)
+			if actualChecksum != checksum {
+				log.Printf("会话 %s 消息校验和不匹配: 期望 %d, 收到 %d", 
+					session.ID, actualChecksum, checksum)
 				break
 			}
 		}
@@ -641,9 +755,11 @@ func (s *VPNServer) handleSessionData(session *VPNSession) {
 // sendHeartbeatResponse 发送心跳响应
 func (s *VPNServer) sendHeartbeatResponse(session *VPNSession) error {
 	response := &Message{
-		Type:    MessageTypeHeartbeat,
-		Length:  0,
-		Payload: []byte{},
+		Type:     MessageTypeHeartbeat,
+		Length:   0,
+		Sequence: 0, // 心跳不使用序列号
+		Checksum: 0,
+		Payload:  []byte{},
 	}
 	responseData, err := response.Serialize()
 	if err != nil {
@@ -655,10 +771,24 @@ func (s *VPNServer) sendHeartbeatResponse(session *VPNSession) error {
 
 // sendDataResponse 发送数据响应
 func (s *VPNServer) sendDataResponse(session *VPNSession, payload []byte) error {
+	// 获取并递增发送序列号
+	session.seqMutex.Lock()
+	seq := session.sendSeq
+	session.sendSeq++
+	session.seqMutex.Unlock()
+	
+	// 计算校验和（可选）
+	checksum := uint32(0)
+	if len(payload) > 0 {
+		checksum = crc32.ChecksumIEEE(payload)
+	}
+	
 	response := &Message{
-		Type:    MessageTypeData,
-		Length:  uint32(len(payload)),
-		Payload: payload,
+		Type:     MessageTypeData,
+		Length:   uint32(len(payload)),
+		Sequence: seq,
+		Checksum: checksum,
+		Payload:  payload,
 	}
 	responseData, err := response.Serialize()
 	if err != nil {
@@ -688,15 +818,9 @@ func (s *VPNServer) handleTUNRead() {
 		// 提取目标IP地址 (IP header offset 16-19)
 		destIP := net.IP(packet[16:20])
 		
-		// 查找对应的会话并转发数据包
+		// 使用IP到会话的映射进行O(1)查找
 		s.sessionMutex.RLock()
-		var targetSession *VPNSession
-		for _, session := range s.sessions {
-			if session.IP.Equal(destIP) {
-				targetSession = session
-				break
-			}
-		}
+		targetSession := s.ipToSession[destIP.String()]
 		s.sessionMutex.RUnlock()
 
 		if targetSession != nil {
@@ -714,6 +838,7 @@ func (s *VPNServer) addSession(id string, session *VPNSession) {
 	s.sessionMutex.Lock()
 	defer s.sessionMutex.Unlock()
 	s.sessions[id] = session
+	s.ipToSession[session.IP.String()] = session // 维护IP到会话的映射
 	s.sessionCount++
 }
 
@@ -724,6 +849,7 @@ func (s *VPNServer) removeSession(id string) {
 	if exists {
 		s.clientIPPool.ReleaseIP(session.IP)
 		delete(s.sessions, id)
+		delete(s.ipToSession, session.IP.String()) // 删除IP映射
 		s.sessionCount--
 	}
 	s.sessionMutex.Unlock()
@@ -736,7 +862,7 @@ func (s *VPNServer) removeSession(id string) {
 
 // cleanupSessions 清理会话
 func (s *VPNServer) cleanupSessions() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(s.config.SessionCleanupInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -762,6 +888,23 @@ func (s *VPNServer) cleanupSessions() {
 	}
 }
 
+// cleanupNATRules 清理NAT规则
+func (s *VPNServer) cleanupNATRules() {
+	for _, rule := range s.natRules {
+		// 将 -A 改为 -D 来删除规则
+		args := []string{"-t", rule.Table, "-D", rule.Chain}
+		args = append(args, rule.Args...)
+		
+		cmd := exec.Command("iptables", args...)
+		if err := cmd.Run(); err != nil {
+			log.Printf("警告：删除NAT规则失败: %v (参数: %v)", err, args)
+		} else {
+			log.Printf("已删除NAT规则: %v", args)
+		}
+	}
+	s.natRules = nil
+}
+
 // Stop 停止服务器
 func (s *VPNServer) Stop() {
 	s.running = false
@@ -781,6 +924,9 @@ func (s *VPNServer) Stop() {
 		s.removeSession(id)
 	}
 	
+	// 清理NAT规则
+	s.cleanupNATRules()
+	
 	// 清理TUN设备
 	if s.tunDevice != nil {
 		s.tunDevice.Close()
@@ -792,49 +938,77 @@ func (s *VPNServer) Stop() {
 type IPPool struct {
 	network    *net.IPNet
 	allocated  map[string]bool
+	freeList   []int          // 新增：空闲IP索引队列
+	ipToIndex  map[string]int // 新增：IP到索引的映射
 	mutex      sync.RWMutex
+	startIndex int            // IP范围起始索引
+	endIndex   int            // IP范围结束索引
 }
 
 // NewIPPool 创建IP地址池
-func NewIPPool(network *net.IPNet) *IPPool {
+func NewIPPool(network *net.IPNet, config *VPNConfig) *IPPool {
+	startIndex := config.ClientIPStart
+	endIndex := config.ClientIPEnd
+	
+	// 初始化空闲列表
+	freeList := make([]int, 0, endIndex-startIndex+1)
+	for i := startIndex; i <= endIndex; i++ {
+		freeList = append(freeList, i)
+	}
+	
 	return &IPPool{
-		network:   network,
-		allocated: make(map[string]bool),
+		network:    network,
+		allocated:  make(map[string]bool),
+		freeList:   freeList,
+		ipToIndex:  make(map[string]int),
+		startIndex: startIndex,
+		endIndex:   endIndex,
 	}
 }
 
-// AllocateIP 分配IP地址
+// AllocateIP 分配IP地址 - O(1)操作
 func (p *IPPool) AllocateIP() net.IP {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	// 从网络中分配IP（跳过网络地址和广播地址）
+	if len(p.freeList) == 0 {
+		return nil
+	}
+
+	// 从队列头取出空闲IP索引
+	index := p.freeList[0]
+	p.freeList = p.freeList[1:]
+
 	ip := p.network.IP.To4()
 	if ip == nil {
 		return nil
 	}
 
-	// 从10.8.0.2开始分配
-	for i := 2; i < 254; i++ {
-		testIP := net.IPv4(ip[0], ip[1], ip[2], byte(i))
-		ipStr := testIP.String()
-		if !p.allocated[ipStr] {
-			p.allocated[ipStr] = true
-			return testIP
-		}
-	}
-
-	return nil
+	allocatedIP := net.IPv4(ip[0], ip[1], ip[2], byte(index))
+	ipStr := allocatedIP.String()
+	p.allocated[ipStr] = true
+	p.ipToIndex[ipStr] = index
+	
+	return allocatedIP
 }
 
-// ReleaseIP 释放IP地址
+// ReleaseIP 释放IP地址 - O(1)操作
 func (p *IPPool) ReleaseIP(ip net.IP) {
 	if ip == nil {
 		return
 	}
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	delete(p.allocated, ip.String())
+	
+	ipStr := ip.String()
+	if p.allocated[ipStr] {
+		delete(p.allocated, ipStr)
+		if index, ok := p.ipToIndex[ipStr]; ok {
+			delete(p.ipToIndex, ipStr)
+			// 回收到队列尾部
+			p.freeList = append(p.freeList, index)
+		}
+	}
 }
 
 // VPNClient VPN客户端结构
@@ -850,6 +1024,9 @@ type VPNClient struct {
 	heartbeatStop  chan struct{}
 	heartbeatMutex sync.Mutex
 	tunDevice      *water.Interface
+	sendSeq        uint32      // 新增：发送序列号
+	recvSeq        uint32      // 新增：接收序列号
+	seqMutex       sync.Mutex  // 新增：序列号锁
 }
 
 // NewVPNClient 创建新的VPN客户端
@@ -926,8 +1103,8 @@ func (c *VPNClient) Connect() error {
 	c.connMutex.Unlock()
 	log.Println("成功连接到VPN服务器，使用TLS 1.3协议")
 
-	// 读取分配的IP - 先读取消息头，手动解析
-	header := make([]byte, 5)
+	// 读取分配的IP - 读取新的消息头格式（13字节）
+	header := make([]byte, 13)
 	_, err = io.ReadFull(c.conn, header)
 	if err != nil {
 		return fmt.Errorf("读取消息头失败: %v", err)
@@ -964,10 +1141,24 @@ func (c *VPNClient) SendData(data []byte) error {
 		return fmt.Errorf("连接未建立")
 	}
 
+	// 获取并递增发送序列号
+	c.seqMutex.Lock()
+	seq := c.sendSeq
+	c.sendSeq++
+	c.seqMutex.Unlock()
+
+	// 计算校验和（可选）
+	checksum := uint32(0)
+	if len(data) > 0 {
+		checksum = crc32.ChecksumIEEE(data)
+	}
+
 	msg := &Message{
-		Type:    MessageTypeData,
-		Length:  uint32(len(data)),
-		Payload: data,
+		Type:     MessageTypeData,
+		Length:   uint32(len(data)),
+		Sequence: seq,
+		Checksum: checksum,
+		Payload:  data,
 	}
 	
 	serialized, err := msg.Serialize()
@@ -990,9 +1181,11 @@ func (c *VPNClient) SendHeartbeat() error {
 	}
 
 	msg := &Message{
-		Type:    MessageTypeHeartbeat,
-		Length:  0,
-		Payload: []byte{},
+		Type:     MessageTypeHeartbeat,
+		Length:   0,
+		Sequence: 0, // 心跳不使用序列号
+		Checksum: 0,
+		Payload:  []byte{},
 	}
 	
 	serialized, err := msg.Serialize()
@@ -1014,8 +1207,8 @@ func (c *VPNClient) ReceiveData() (MessageType, []byte, error) {
 		return 0, nil, fmt.Errorf("连接未建立")
 	}
 
-	// 读取消息头
-	header := make([]byte, 5)
+	// 读取消息头（13字节）
+	header := make([]byte, 13)
 	_, err := io.ReadFull(conn, header)
 	if err != nil {
 		return 0, nil, err
@@ -1024,12 +1217,40 @@ func (c *VPNClient) ReceiveData() (MessageType, []byte, error) {
 	// 手动解析消息头
 	msgType := MessageType(header[0])
 	length := binary.BigEndian.Uint32(header[1:5])
+	sequence := binary.BigEndian.Uint32(header[5:9])
+	checksum := binary.BigEndian.Uint32(header[9:13])
 
 	// 读取消息体
 	payload := make([]byte, length)
-	_, err = io.ReadFull(conn, payload)
-	if err != nil {
-		return 0, nil, err
+	if length > 0 {
+		_, err = io.ReadFull(conn, payload)
+		if err != nil {
+			return 0, nil, err
+		}
+	}
+
+	// 验证序列号（心跳和IP分配消息除外）
+	if msgType != MessageTypeHeartbeat && msgType != MessageTypeIPAssignment {
+		c.seqMutex.Lock()
+		// 检测重放攻击（序列号回退）
+		if sequence < c.recvSeq {
+			c.seqMutex.Unlock()
+			return 0, nil, fmt.Errorf("检测到重放攻击：期望序列号 >= %d，收到 %d", c.recvSeq, sequence)
+		}
+		// 检测消息丢失（序列号跳跃）
+		if sequence > c.recvSeq+1 && c.recvSeq > 0 {
+			log.Printf("警告：检测到消息丢失，期望序列号 %d，收到 %d", c.recvSeq+1, sequence)
+		}
+		c.recvSeq = sequence
+		c.seqMutex.Unlock()
+	}
+
+	// 验证校验和（如果提供）
+	if checksum != 0 && len(payload) > 0 {
+		actualChecksum := crc32.ChecksumIEEE(payload)
+		if actualChecksum != checksum {
+			return 0, nil, fmt.Errorf("消息校验和不匹配: 期望 %d, 收到 %d", actualChecksum, checksum)
+		}
 	}
 
 	return msgType, payload, nil
@@ -1296,7 +1517,7 @@ func enableIPForwarding() error {
 	return nil
 }
 
-// setupNAT 配置NAT（可选）
+// setupNAT 配置NAT（可选）- 已废弃，请使用 VPNServer.SetupNAT
 func setupNAT(vpnNetwork string, outInterface string) error {
 	// 检查iptables规则是否已存在
 	checkCmd := exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", vpnNetwork, "-o", outInterface, "-j", "MASQUERADE")
@@ -1312,6 +1533,37 @@ func setupNAT(vpnNetwork string, outInterface string) error {
 	if err != nil {
 		return fmt.Errorf("配置NAT失败: %v, 输出: %s", err, string(output))
 	}
+	log.Printf("已配置NAT: %s -> %s", vpnNetwork, outInterface)
+	return nil
+}
+
+// SetupNAT 配置NAT并跟踪规则
+func (s *VPNServer) SetupNAT(vpnNetwork string, outInterface string) error {
+	args := []string{"-s", vpnNetwork, "-o", outInterface, "-j", "MASQUERADE"}
+	
+	// 检查规则是否已存在
+	checkArgs := append([]string{"-t", "nat", "-C", "POSTROUTING"}, args...)
+	checkCmd := exec.Command("iptables", checkArgs...)
+	if checkCmd.Run() == nil {
+		log.Println("NAT规则已存在，跳过添加")
+		return nil
+	}
+	
+	// 添加规则
+	addArgs := append([]string{"-t", "nat", "-A", "POSTROUTING"}, args...)
+	cmd := exec.Command("iptables", addArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("添加NAT规则失败: %v, 输出: %s", err, string(output))
+	}
+	
+	// 记录规则以便后续清理
+	s.natRules = append(s.natRules, NATRule{
+		Table: "nat",
+		Chain: "POSTROUTING",
+		Args:  args,
+	})
+	
 	log.Printf("已配置NAT: %s -> %s", vpnNetwork, outInterface)
 	return nil
 }
