@@ -191,3 +191,95 @@ func TestParseServerIP(t *testing.T) {
 	
 	t.Logf("服务器IP: %s, 网络: %s", ip, network)
 }
+
+// TestRoutingConfiguration 测试路由配置
+func TestRoutingConfiguration(t *testing.T) {
+	// 测试默认配置
+	config := DefaultConfig
+	
+	if config.RouteMode != "split" {
+		t.Errorf("默认路由模式应该是 'split'，实际是: %s", config.RouteMode)
+	}
+	
+	if config.RedirectGateway != false {
+		t.Error("默认不应该重定向网关")
+	}
+	
+	if config.RedirectDNS != false {
+		t.Error("默认不应该劫持DNS")
+	}
+	
+	if config.EnableNAT != true {
+		t.Error("默认应该启用NAT")
+	}
+	
+	if len(config.ExcludeRoutes) != 0 {
+		t.Error("默认排除路由列表应该为空")
+	}
+	
+	// 测试配置序列化和反序列化
+	configFile := ConfigFile{
+		ServerAddress:   "test.example.com",
+		ServerPort:      8080,
+		Network:         "10.8.0.0/24",
+		MTU:             1500,
+		RouteMode:       "full",
+		ExcludeRoutes:   []string{"192.168.1.0/24"},
+		RedirectGateway: true,
+		RedirectDNS:     true,
+		EnableNAT:       false,
+		NATInterface:    "eth0",
+	}
+	
+	vpnConfig := configFile.ToVPNConfig()
+	
+	if vpnConfig.RouteMode != "full" {
+		t.Errorf("路由模式转换错误，期望 'full'，得到: %s", vpnConfig.RouteMode)
+	}
+	
+	if !vpnConfig.RedirectGateway {
+		t.Error("RedirectGateway 转换错误")
+	}
+	
+	if !vpnConfig.RedirectDNS {
+		t.Error("RedirectDNS 转换错误")
+	}
+	
+	if vpnConfig.EnableNAT {
+		t.Error("EnableNAT 转换错误")
+	}
+	
+	if vpnConfig.NATInterface != "eth0" {
+		t.Errorf("NATInterface 转换错误，期望 'eth0'，得到: %s", vpnConfig.NATInterface)
+	}
+	
+	if len(vpnConfig.ExcludeRoutes) != 1 || vpnConfig.ExcludeRoutes[0] != "192.168.1.0/24" {
+		t.Errorf("ExcludeRoutes 转换错误: %v", vpnConfig.ExcludeRoutes)
+	}
+}
+
+// TestRouteEntryStructure 测试路由条目结构
+func TestRouteEntryStructure(t *testing.T) {
+	entry := RouteEntry{
+		Destination: "192.168.1.0/24",
+		Gateway:     "10.8.0.1",
+		Interface:   "tun0",
+		Metric:      100,
+	}
+	
+	if entry.Destination != "192.168.1.0/24" {
+		t.Error("路由条目Destination字段错误")
+	}
+	
+	if entry.Gateway != "10.8.0.1" {
+		t.Error("路由条目Gateway字段错误")
+	}
+	
+	if entry.Interface != "tun0" {
+		t.Error("路由条目Interface字段错误")
+	}
+	
+	if entry.Metric != 100 {
+		t.Error("路由条目Metric字段错误")
+	}
+}
