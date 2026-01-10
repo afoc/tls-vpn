@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"hash/crc32"
@@ -379,6 +380,15 @@ func (cm *CertificateManager) ClientTLSConfig() *tls.Config {
 		MinVersion:   tls.VersionTLS13,
 		MaxVersion:   tls.VersionTLS13,
 	}
+}
+
+// ClientConfig 客户端配置（用于推送给客户端）
+type ClientConfig struct {
+	AssignedIP string   `json:"assigned_ip"` // 分配的IP地址（例如 "10.8.0.2/24"）
+	ServerIP   string   `json:"server_ip"`   // 服务器IP地址
+	DNS        []string `json:"dns"`         // DNS服务器列表
+	Routes     []string `json:"routes"`      // 路由列表（CIDR格式）
+	MTU        int      `json:"mtu"`         // MTU大小
 }
 
 // VPNSession VPN会话结构
@@ -796,6 +806,53 @@ func (s *VPNServer) sendDataResponse(session *VPNSession, payload []byte) error 
 	}
 	_, err = session.TLSConn.Write(responseData)
 	return err
+}
+
+// pushConfigToClient 推送配置给客户端
+func (s *VPNServer) pushConfigToClient(session *VPNSession) error {
+	// 准备客户端配置
+	config := ClientConfig{
+		AssignedIP: session.IP.String() + "/24",
+		ServerIP:   s.config.ServerIP,
+		DNS:        s.config.DNSServers,
+		Routes:     s.config.PushRoutes,
+		MTU:        s.config.MTU,
+	}
+	
+	// 序列化为JSON
+	data, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("序列化客户端配置失败: %v", err)
+	}
+	
+	// 获取并递增发送序列号
+	session.seqMutex.Lock()
+	seq := session.sendSeq
+	session.sendSeq++
+	session.seqMutex.Unlock()
+	
+	// 发送控制消息
+	msg := &Message{
+		Type:     MessageTypeControl,
+		Length:   uint32(len(data)),
+		Sequence: seq,
+		Checksum: crc32.ChecksumIEEE(data),
+		Payload:  data,
+	}
+	
+	msgData, err := msg.Serialize()
+	if err != nil {
+		return fmt.Errorf("序列化控制消息失败: %v", err)
+	}
+	
+	_, err = session.TLSConn.Write(msgData)
+	if err != nil {
+		return fmt.Errorf("发送配置失败: %v", err)
+	}
+	
+	log.Printf("已推送配置给客户端 %s: DNS=%v, Routes=%v, MTU=%d", 
+		session.IP, config.DNS, config.Routes, config.MTU)
+	return nil
 }
 
 // handleTUNRead 处理从TUN设备读取的数据
@@ -1401,8 +1458,23 @@ func (c *VPNClient) dataLoop() {
 			continue
 		}
 
+		// 处理控制消息
+		if msgType == MessageTypeControl {
+			if len(data) > 0 {
+				var config ClientConfig
+				if err := json.Unmarshal(data, &config); err != nil {
+					log.Printf("解析服务器配置失败: %v", err)
+				} else {
+					if err := c.applyServerConfig(&config); err != nil {
+						log.Printf("应用服务器配置失败: %v", err)
+					}
+				}
+			}
+			continue
+		}
+
 		// 处理数据包
-		if data != nil && len(data) > 0 {
+		if msgType == MessageTypeData && data != nil && len(data) > 0 {
 			if c.tunDevice != nil {
 				// 写入TUN设备
 				_, err := c.tunDevice.Write(data)
@@ -1443,6 +1515,37 @@ func (c *VPNClient) Close() {
 		c.tunDevice.Close()
 		cleanupTUNDevice("tun0")
 	}
+}
+
+// applyServerConfig 应用服务器推送的配置
+func (c *VPNClient) applyServerConfig(config *ClientConfig) error {
+	log.Printf("收到服务器配置: DNS=%v, Routes=%v, MTU=%d", config.DNS, config.Routes, config.MTU)
+	
+	// 记录DNS服务器（可以修改/etc/resolv.conf，但需谨慎）
+	for _, dns := range config.DNS {
+		log.Printf("推荐DNS: %s", dns)
+	}
+	
+	// 添加路由
+	for _, route := range config.Routes {
+		// 解析服务器IP以获取网关（去掉CIDR后缀）
+		serverIPStr := config.ServerIP
+		for i := 0; i < len(serverIPStr); i++ {
+			if serverIPStr[i] == '/' {
+				serverIPStr = serverIPStr[:i]
+				break
+			}
+		}
+		
+		cmd := exec.Command("ip", "route", "add", route, "via", serverIPStr, "dev", "tun0")
+		if err := cmd.Run(); err != nil {
+			log.Printf("警告：添加路由 %s 失败: %v", route, err)
+		} else {
+			log.Printf("已添加路由: %s via %s", route, serverIPStr)
+		}
+	}
+	
+	return nil
 }
 
 // min 辅助函数
