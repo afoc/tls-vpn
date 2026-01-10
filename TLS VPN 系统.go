@@ -802,17 +802,17 @@ func (s *VPNServer) Start() {
 
 // handleConnection 处理连接
 func (s *VPNServer) handleConnection(conn net.Conn) {
-	defer conn.Close()
-
 	tlsConn, ok := conn.(*tls.Conn)
 	if !ok {
 		log.Printf("非TLS连接被拒绝: %s", conn.RemoteAddr())
+		conn.Close()
 		return
 	}
 
 	err := tlsConn.Handshake()
 	if err != nil {
 		log.Printf("TLS握手失败: %v", err)
+		conn.Close()
 		return
 	}
 
@@ -820,6 +820,7 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		log.Printf("客户端未提供证书: %s", conn.RemoteAddr())
+		conn.Close()
 		return
 	}
 
@@ -829,6 +830,7 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 	s.sessionMutex.RUnlock()
 	if count >= int64(s.config.MaxConnections) {
 		log.Printf("连接数已达到上限: %d", s.config.MaxConnections)
+		conn.Close()
 		return
 	}
 
@@ -840,6 +842,7 @@ func (s *VPNServer) handleConnection(conn net.Conn) {
 	clientIP := s.clientIPPool.AllocateIP()
 	if clientIP == nil {
 		log.Printf("IP地址池已满: %s", conn.RemoteAddr())
+		conn.Close()
 		return
 	}
 
