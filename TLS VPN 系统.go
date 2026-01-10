@@ -50,6 +50,12 @@ type ConfigFile struct {
 	ClientIPEnd            int      `json:"client_ip_end"`
 	DNSServers             []string `json:"dns_servers"`
 	PushRoutes             []string `json:"push_routes"`
+	RouteMode              string   `json:"route_mode"`
+	ExcludeRoutes          []string `json:"exclude_routes"`
+	RedirectGateway        bool     `json:"redirect_gateway"`
+	RedirectDNS            bool     `json:"redirect_dns"`
+	EnableNAT              bool     `json:"enable_nat"`
+	NATInterface           string   `json:"nat_interface"`
 }
 
 // ToVPNConfig 将ConfigFile转换为VPNConfig
@@ -70,6 +76,12 @@ func (cf *ConfigFile) ToVPNConfig() VPNConfig {
 		ClientIPEnd:            cf.ClientIPEnd,
 		DNSServers:             cf.DNSServers,
 		PushRoutes:             cf.PushRoutes,
+		RouteMode:              cf.RouteMode,
+		ExcludeRoutes:          cf.ExcludeRoutes,
+		RedirectGateway:        cf.RedirectGateway,
+		RedirectDNS:            cf.RedirectDNS,
+		EnableNAT:              cf.EnableNAT,
+		NATInterface:           cf.NATInterface,
 	}
 }
 
@@ -90,6 +102,12 @@ type VPNConfig struct {
 	ClientIPEnd            int           // 新增：客户端IP结束 (默认 254)
 	DNSServers             []string      // 新增：推送给客户端的DNS
 	PushRoutes             []string      // 新增：推送给客户端的路由 (CIDR格式)
+	RouteMode              string        // 新增：路由模式 "full" 或 "split"
+	ExcludeRoutes          []string      // 新增：排除的路由（full模式使用）
+	RedirectGateway        bool          // 新增：是否重定向默认网关
+	RedirectDNS            bool          // 新增：是否劫持DNS
+	EnableNAT              bool          // 新增：服务器端是否启用NAT
+	NATInterface           string        // 新增：NAT出口网卡（空字符串=自动检测）
 }
 
 // ValidateConfig 验证配置
@@ -201,6 +219,12 @@ func SaveConfigToFile(filename string, config VPNConfig) error {
 		ClientIPEnd:               config.ClientIPEnd,
 		DNSServers:                config.DNSServers,
 		PushRoutes:                config.PushRoutes,
+		RouteMode:                 config.RouteMode,
+		ExcludeRoutes:             config.ExcludeRoutes,
+		RedirectGateway:           config.RedirectGateway,
+		RedirectDNS:               config.RedirectDNS,
+		EnableNAT:                 config.EnableNAT,
+		NATInterface:              config.NATInterface,
 	}
 	
 	data, err := json.MarshalIndent(configFile, "", "  ")
@@ -232,6 +256,309 @@ var DefaultConfig = VPNConfig{
 	ClientIPEnd:            254,
 	DNSServers:             []string{"8.8.8.8", "8.8.4.4"},
 	PushRoutes:             []string{},
+	RouteMode:              "split",
+	ExcludeRoutes:          []string{},
+	RedirectGateway:        false,
+	RedirectDNS:            false,
+	EnableNAT:              true,
+	NATInterface:           "",
+}
+
+// RouteEntry 路由条目
+type RouteEntry struct {
+	Destination string
+	Gateway     string
+	Interface   string
+	Metric      int
+}
+
+// RouteManager 路由管理器
+type RouteManager struct {
+	installedRoutes []RouteEntry
+	originalDNS     []string
+	defaultGateway  string
+	defaultIface    string
+	mutex           sync.Mutex
+}
+
+// NewRouteManager 创建路由管理器并自动检测默认网关
+func NewRouteManager() (*RouteManager, error) {
+	rm := &RouteManager{
+		installedRoutes: make([]RouteEntry, 0),
+		originalDNS:     make([]string, 0),
+	}
+	
+	// 检测默认网关和接口
+	if err := rm.detectDefaultGateway(); err != nil {
+		return nil, fmt.Errorf("检测默认网关失败: %v", err)
+	}
+	
+	log.Printf("检测到默认网关: %s (接口: %s)", rm.defaultGateway, rm.defaultIface)
+	return rm, nil
+}
+
+// detectDefaultGateway 检测默认网关
+func (rm *RouteManager) detectDefaultGateway() error {
+	// 使用 ip route 命令获取默认路由
+	cmd := exec.Command("ip", "route", "show", "default")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("执行ip route命令失败: %v", err)
+	}
+	
+	// 解析输出，格式如: default via 192.168.1.1 dev eth0
+	lines := string(output)
+	if lines == "" {
+		return fmt.Errorf("未找到默认路由")
+	}
+	
+	// 简单解析第一行
+	fields := make([]string, 0)
+	for _, field := range []byte(lines) {
+		if field == ' ' || field == '\t' || field == '\n' {
+			continue
+		}
+		fields = append(fields, string(field))
+	}
+	
+	// 更好的解析方式
+	parts := make([]string, 0)
+	current := ""
+	for _, ch := range lines {
+		if ch == ' ' || ch == '\t' || ch == '\n' {
+			if current != "" {
+				parts = append(parts, current)
+				current = ""
+			}
+		} else {
+			current += string(ch)
+		}
+	}
+	if current != "" {
+		parts = append(parts, current)
+	}
+	
+	// 查找 via 和 dev 关键字
+	for i := 0; i < len(parts); i++ {
+		if parts[i] == "via" && i+1 < len(parts) {
+			rm.defaultGateway = parts[i+1]
+		}
+		if parts[i] == "dev" && i+1 < len(parts) {
+			rm.defaultIface = parts[i+1]
+		}
+	}
+	
+	if rm.defaultGateway == "" {
+		return fmt.Errorf("无法从路由表中解析默认网关")
+	}
+	if rm.defaultIface == "" {
+		return fmt.Errorf("无法从路由表中解析默认接口")
+	}
+	
+	return nil
+}
+
+// AddRoute 添加路由
+func (rm *RouteManager) AddRoute(destination, gateway, iface string) error {
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+	
+	// 构建 ip route add 命令
+	args := []string{"route", "add", destination}
+	if gateway != "" {
+		args = append(args, "via", gateway)
+	}
+	if iface != "" {
+		args = append(args, "dev", iface)
+	}
+	
+	cmd := exec.Command("ip", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// 检查是否是因为路由已存在
+		if string(output) != "" && (len(output) > 0) {
+			// 路由可能已存在，记录警告但不返回错误
+			log.Printf("警告：添加路由可能失败: %s, 输出: %s", destination, string(output))
+		} else {
+			return fmt.Errorf("添加路由失败: %v, 输出: %s", err, string(output))
+		}
+	}
+	
+	// 记录已安装的路由
+	rm.installedRoutes = append(rm.installedRoutes, RouteEntry{
+		Destination: destination,
+		Gateway:     gateway,
+		Interface:   iface,
+	})
+	
+	log.Printf("已添加路由: %s via %s dev %s", destination, gateway, iface)
+	return nil
+}
+
+// DeleteRoute 删除路由
+func (rm *RouteManager) DeleteRoute(destination string) error {
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+	
+	cmd := exec.Command("ip", "route", "del", destination)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("删除路由失败: %v, 输出: %s", err, string(output))
+	}
+	
+	log.Printf("已删除路由: %s", destination)
+	return nil
+}
+
+// CleanupRoutes 清理所有已安装的路由
+func (rm *RouteManager) CleanupRoutes() {
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+	
+	for _, route := range rm.installedRoutes {
+		cmd := exec.Command("ip", "route", "del", route.Destination)
+		if err := cmd.Run(); err != nil {
+			log.Printf("警告：删除路由 %s 失败: %v", route.Destination, err)
+		} else {
+			log.Printf("已清理路由: %s", route.Destination)
+		}
+	}
+	
+	rm.installedRoutes = make([]RouteEntry, 0)
+}
+
+// SaveDNS 保存原始DNS配置
+func (rm *RouteManager) SaveDNS() error {
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+	
+	// 读取 /etc/resolv.conf
+	data, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return fmt.Errorf("读取resolv.conf失败: %v", err)
+	}
+	
+	// 备份到 /etc/resolv.conf.vpn-backup
+	if err := os.WriteFile("/etc/resolv.conf.vpn-backup", data, 0644); err != nil {
+		return fmt.Errorf("备份resolv.conf失败: %v", err)
+	}
+	
+	// 解析DNS服务器
+	lines := string(data)
+	rm.originalDNS = make([]string, 0)
+	for _, line := range splitLines(lines) {
+		line = trimSpace(line)
+		if len(line) > 10 && line[0:10] == "nameserver" {
+			parts := splitBySpace(line)
+			if len(parts) >= 2 {
+				rm.originalDNS = append(rm.originalDNS, parts[1])
+			}
+		}
+	}
+	
+	log.Printf("已保存原始DNS配置: %v", rm.originalDNS)
+	return nil
+}
+
+// SetDNS 设置DNS服务器
+func (rm *RouteManager) SetDNS(dnsServers []string) error {
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+	
+	// 构建新的 resolv.conf 内容
+	content := "# Generated by VPN client\n"
+	for _, dns := range dnsServers {
+		content += fmt.Sprintf("nameserver %s\n", dns)
+	}
+	
+	// 写入 /etc/resolv.conf
+	if err := os.WriteFile("/etc/resolv.conf", []byte(content), 0644); err != nil {
+		return fmt.Errorf("写入resolv.conf失败: %v", err)
+	}
+	
+	log.Printf("已设置DNS服务器: %v", dnsServers)
+	return nil
+}
+
+// RestoreDNS 恢复原始DNS配置
+func (rm *RouteManager) RestoreDNS() error {
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+	
+	// 检查备份文件是否存在
+	if _, err := os.Stat("/etc/resolv.conf.vpn-backup"); os.IsNotExist(err) {
+		log.Println("没有找到DNS备份文件，跳过恢复")
+		return nil
+	}
+	
+	// 恢复备份
+	data, err := os.ReadFile("/etc/resolv.conf.vpn-backup")
+	if err != nil {
+		return fmt.Errorf("读取DNS备份失败: %v", err)
+	}
+	
+	if err := os.WriteFile("/etc/resolv.conf", data, 0644); err != nil {
+		return fmt.Errorf("恢复DNS配置失败: %v", err)
+	}
+	
+	// 删除备份文件
+	os.Remove("/etc/resolv.conf.vpn-backup")
+	
+	log.Println("已恢复原始DNS配置")
+	return nil
+}
+
+// 辅助函数：分割字符串为行
+func splitLines(s string) []string {
+	lines := make([]string, 0)
+	current := ""
+	for _, ch := range s {
+		if ch == '\n' {
+			lines = append(lines, current)
+			current = ""
+		} else {
+			current += string(ch)
+		}
+	}
+	if current != "" {
+		lines = append(lines, current)
+	}
+	return lines
+}
+
+// 辅助函数：去除首尾空格
+func trimSpace(s string) string {
+	start := 0
+	end := len(s)
+	
+	for start < end && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
+		end--
+	}
+	
+	return s[start:end]
+}
+
+// 辅助函数：按空格分割字符串
+func splitBySpace(s string) []string {
+	parts := make([]string, 0)
+	current := ""
+	for _, ch := range s {
+		if ch == ' ' || ch == '\t' {
+			if current != "" {
+				parts = append(parts, current)
+				current = ""
+			}
+		} else {
+			current += string(ch)
+		}
+	}
+	if current != "" {
+		parts = append(parts, current)
+	}
+	return parts
 }
 
 // MessageType 消息类型枚举
@@ -1324,6 +1651,7 @@ type VPNClient struct {
 	sendSeq        uint32      // 新增：发送序列号
 	recvSeq        uint32      // 新增：接收序列号
 	seqMutex       sync.Mutex  // 新增：序列号锁
+	routeManager   *RouteManager // 新增：路由管理器
 }
 
 // NewVPNClient 创建新的VPN客户端
@@ -1572,6 +1900,13 @@ func (c *VPNClient) Run() {
 				c.Close()
 				continue
 			}
+			
+			// 配置路由
+			if err := c.setupRoutes(); err != nil {
+				log.Printf("配置路由失败: %v", err)
+				c.Close()
+				continue
+			}
 		}
 
 		// 初始化心跳停止通道
@@ -1735,6 +2070,130 @@ func (c *VPNClient) dataLoop() {
 	}
 }
 
+// setupRoutes 设置路由（根据配置模式）
+func (c *VPNClient) setupRoutes() error {
+	// 创建路由管理器
+	rm, err := NewRouteManager()
+	if err != nil {
+		return fmt.Errorf("创建路由管理器失败: %v", err)
+	}
+	c.routeManager = rm
+	
+	// 获取服务器IP（去掉CIDR后缀）
+	serverIP := c.config.ServerAddress
+	
+	// 添加到VPN服务器的路由，确保不走VPN
+	serverRoute := serverIP + "/32"
+	if err := rm.AddRoute(serverRoute, rm.defaultGateway, rm.defaultIface); err != nil {
+		log.Printf("警告：添加到VPN服务器的路由失败: %v", err)
+	}
+	
+	// 根据路由模式设置路由
+	switch c.config.RouteMode {
+	case "full":
+		return c.setupFullTunnelRoutes(rm)
+	case "split":
+		return c.setupSplitTunnelRoutes(rm)
+	default:
+		log.Printf("警告：未知的路由模式 %s，使用分流模式", c.config.RouteMode)
+		return c.setupSplitTunnelRoutes(rm)
+	}
+}
+
+// setupFullTunnelRoutes 设置全流量模式路由
+func (c *VPNClient) setupFullTunnelRoutes(rm *RouteManager) error {
+	log.Println("配置全流量代理模式...")
+	
+	// 获取VPN网关（服务器在VPN网络中的IP）
+	vpnGateway := ""
+	if c.config.ServerIP != "" {
+		// 解析服务器IP，去掉CIDR
+		for i := 0; i < len(c.config.ServerIP); i++ {
+			if c.config.ServerIP[i] == '/' {
+				vpnGateway = c.config.ServerIP[:i]
+				break
+			}
+		}
+	}
+	if vpnGateway == "" {
+		vpnGateway = "10.8.0.1" // 默认值
+	}
+	
+	// 添加 0.0.0.0/1 和 128.0.0.0/1 路由（覆盖所有IP）
+	routes := []string{"0.0.0.0/1", "128.0.0.0/1"}
+	for _, route := range routes {
+		// 检查是否被排除
+		if c.isExcluded(route) {
+			log.Printf("跳过被排除的路由: %s", route)
+			continue
+		}
+		
+		if err := rm.AddRoute(route, vpnGateway, "tun0"); err != nil {
+			log.Printf("警告：添加路由 %s 失败: %v", route, err)
+		}
+	}
+	
+	// 处理排除路由 - 添加到原始网关
+	for _, excludeRoute := range c.config.ExcludeRoutes {
+		if err := rm.AddRoute(excludeRoute, rm.defaultGateway, rm.defaultIface); err != nil {
+			log.Printf("警告：添加排除路由 %s 失败: %v", excludeRoute, err)
+		}
+	}
+	
+	// 配置DNS（如果启用）
+	if c.config.RedirectDNS && len(c.config.DNSServers) > 0 {
+		if err := rm.SaveDNS(); err != nil {
+			log.Printf("警告：保存DNS配置失败: %v", err)
+		} else {
+			if err := rm.SetDNS(c.config.DNSServers); err != nil {
+				log.Printf("警告：设置DNS失败: %v", err)
+			}
+		}
+	}
+	
+	log.Println("全流量代理模式配置完成")
+	return nil
+}
+
+// setupSplitTunnelRoutes 设置分流模式路由
+func (c *VPNClient) setupSplitTunnelRoutes(rm *RouteManager) error {
+	log.Println("配置分流模式...")
+	
+	// 获取VPN网关
+	vpnGateway := ""
+	if c.config.ServerIP != "" {
+		for i := 0; i < len(c.config.ServerIP); i++ {
+			if c.config.ServerIP[i] == '/' {
+				vpnGateway = c.config.ServerIP[:i]
+				break
+			}
+		}
+	}
+	if vpnGateway == "" {
+		vpnGateway = "10.8.0.1"
+	}
+	
+	// 只添加 push_routes 中的路由
+	for _, route := range c.config.PushRoutes {
+		if err := rm.AddRoute(route, vpnGateway, "tun0"); err != nil {
+			log.Printf("警告：添加路由 %s 失败: %v", route, err)
+		}
+	}
+	
+	log.Printf("分流模式配置完成，已添加 %d 条路由", len(c.config.PushRoutes))
+	return nil
+}
+
+// isExcluded 检查路由是否被排除
+func (c *VPNClient) isExcluded(route string) bool {
+	for _, excludeRoute := range c.config.ExcludeRoutes {
+		if route == excludeRoute {
+			return true
+		}
+	}
+	return false
+}
+
 // Close 关闭客户端
 func (c *VPNClient) Close() {
 	c.running = false
@@ -1742,6 +2201,12 @@ func (c *VPNClient) Close() {
 	
 	// 停止心跳协程
 	c.stopHeartbeat()
+	
+	// 清理路由和DNS
+	if c.routeManager != nil {
+		c.routeManager.CleanupRoutes()
+		c.routeManager.RestoreDNS()
+	}
 	
 	c.connMutex.Lock()
 	if c.conn != nil {
@@ -1911,6 +2376,73 @@ func (s *VPNServer) SetupNAT(vpnNetwork string, outInterface string) error {
 	return nil
 }
 
+// setupServerNAT 配置服务器NAT（辅助函数）
+func setupServerNAT(server *VPNServer, config VPNConfig) error {
+	// 确定NAT出口接口
+	natIface := config.NATInterface
+	if natIface == "" {
+		// 自动检测默认出口接口
+		cmd := exec.Command("ip", "route", "show", "default")
+		output, err := cmd.Output()
+		if err != nil {
+			return fmt.Errorf("检测默认出口接口失败: %v", err)
+		}
+		
+		// 解析输出
+		lines := string(output)
+		parts := splitBySpace(lines)
+		for i := 0; i < len(parts); i++ {
+			if parts[i] == "dev" && i+1 < len(parts) {
+				natIface = parts[i+1]
+				break
+			}
+		}
+		
+		if natIface == "" {
+			return fmt.Errorf("无法自动检测出口接口")
+		}
+		log.Printf("自动检测到NAT出口接口: %s", natIface)
+	}
+	
+	// 配置NAT
+	if err := server.SetupNAT(config.Network, natIface); err != nil {
+		return fmt.Errorf("配置NAT失败: %v", err)
+	}
+	
+	// 添加FORWARD规则
+	// 允许 tun0 -> natIface 的转发
+	forwardArgs1 := []string{"-A", "FORWARD", "-i", "tun0", "-o", natIface, "-j", "ACCEPT"}
+	cmd := exec.Command("iptables", forwardArgs1...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("警告：添加FORWARD规则失败: %v, 输出: %s", err, string(output))
+	} else {
+		log.Printf("已添加FORWARD规则: tun0 -> %s", natIface)
+		// 记录规则以便清理
+		server.natRules = append(server.natRules, NATRule{
+			Table: "filter",
+			Chain: "FORWARD",
+			Args:  []string{"-i", "tun0", "-o", natIface, "-j", "ACCEPT"},
+		})
+	}
+	
+	// 允许 natIface -> tun0 的已建立连接
+	forwardArgs2 := []string{"-A", "FORWARD", "-i", natIface, "-o", "tun0", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"}
+	cmd = exec.Command("iptables", forwardArgs2...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("警告：添加FORWARD规则失败: %v, 输出: %s", err, string(output))
+	} else {
+		log.Printf("已添加FORWARD规则: %s -> tun0 (RELATED,ESTABLISHED)", natIface)
+		// 记录规则以便清理
+		server.natRules = append(server.natRules, NATRule{
+			Table: "filter",
+			Chain: "FORWARD",
+			Args:  []string{"-i", natIface, "-o", "tun0", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+		})
+	}
+	
+	return nil
+}
+
 // cleanupTUNDevice 清理TUN设备
 func cleanupTUNDevice(ifaceName string) {
 	cmd := exec.Command("ip", "link", "set", "dev", ifaceName, "down")
@@ -1978,6 +2510,13 @@ func main() {
 		// 初始化TUN设备
 		if err := server.InitializeTUN(); err != nil {
 			log.Fatalf("初始化TUN设备失败: %v", err)
+		}
+		
+		// 配置NAT（如果启用）
+		if config.EnableNAT {
+			if err := setupServerNAT(server, config); err != nil {
+				log.Fatalf("配置NAT失败: %v", err)
+			}
 		}
 		
 		// 显示证书复制提示
