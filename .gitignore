@@ -30,3 +30,9 @@ Thumbs.db
 
 # Temporary files
 /tmp/
+
+# Certificate directory
+certs/
+
+# Configuration file (may contain sensitive settings)
+config.json

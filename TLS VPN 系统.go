@@ -27,6 +27,52 @@ import (
 	"github.com/songgao/water"
 )
 
+// DefaultCertDir 默认证书目录
+const DefaultCertDir = "./certs"
+
+// DefaultConfigFile 默认配置文件路径
+const DefaultConfigFile = "./config.json"
+
+// ConfigFile JSON配置文件结构（用于序列化和反序列化）
+type ConfigFile struct {
+	ServerAddress          string   `json:"server_address"`
+	ServerPort             int      `json:"server_port"`
+	ClientAddress          string   `json:"client_address"`
+	Network                string   `json:"network"`
+	MTU                    int      `json:"mtu"`
+	KeepAliveTimeoutSec    int      `json:"keep_alive_timeout_sec"`
+	ReconnectDelaySec      int      `json:"reconnect_delay_sec"`
+	MaxConnections         int      `json:"max_connections"`
+	SessionTimeoutSec      int      `json:"session_timeout_sec"`
+	SessionCleanupIntervalSec int   `json:"session_cleanup_interval_sec"`
+	ServerIP               string   `json:"server_ip"`
+	ClientIPStart          int      `json:"client_ip_start"`
+	ClientIPEnd            int      `json:"client_ip_end"`
+	DNSServers             []string `json:"dns_servers"`
+	PushRoutes             []string `json:"push_routes"`
+}
+
+// ToVPNConfig 将ConfigFile转换为VPNConfig
+func (cf *ConfigFile) ToVPNConfig() VPNConfig {
+	return VPNConfig{
+		ServerAddress:          cf.ServerAddress,
+		ServerPort:             cf.ServerPort,
+		ClientAddress:          cf.ClientAddress,
+		Network:                cf.Network,
+		MTU:                    cf.MTU,
+		KeepAliveTimeout:       time.Duration(cf.KeepAliveTimeoutSec) * time.Second,
+		ReconnectDelay:         time.Duration(cf.ReconnectDelaySec) * time.Second,
+		MaxConnections:         cf.MaxConnections,
+		SessionTimeout:         time.Duration(cf.SessionTimeoutSec) * time.Second,
+		SessionCleanupInterval: time.Duration(cf.SessionCleanupIntervalSec) * time.Second,
+		ServerIP:               cf.ServerIP,
+		ClientIPStart:          cf.ClientIPStart,
+		ClientIPEnd:            cf.ClientIPEnd,
+		DNSServers:             cf.DNSServers,
+		PushRoutes:             cf.PushRoutes,
+	}
+}
+
 // VPNConfig VPN配置结构
 type VPNConfig struct {
 	ServerAddress          string
@@ -113,6 +159,60 @@ func (c *VPNConfig) ParseServerIP() (net.IP, *net.IPNet, error) {
 		return nil, nil, fmt.Errorf("无效的服务器IP: %v", err)
 	}
 	return ip, ipNet, nil
+}
+
+// LoadConfigFromFile 从文件加载配置
+func LoadConfigFromFile(filename string) (VPNConfig, error) {
+	// 检查文件是否存在
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		return VPNConfig{}, fmt.Errorf("配置文件不存在: %s", filename)
+	}
+	
+	// 读取文件
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return VPNConfig{}, fmt.Errorf("读取配置文件失败: %v", err)
+	}
+	
+	// 解析JSON
+	var configFile ConfigFile
+	if err := json.Unmarshal(data, &configFile); err != nil {
+		return VPNConfig{}, fmt.Errorf("解析配置文件失败: %v", err)
+	}
+	
+	return configFile.ToVPNConfig(), nil
+}
+
+// SaveConfigToFile 保存配置到文件（创建示例配置）
+func SaveConfigToFile(filename string, config VPNConfig) error {
+	configFile := ConfigFile{
+		ServerAddress:             config.ServerAddress,
+		ServerPort:                config.ServerPort,
+		ClientAddress:             config.ClientAddress,
+		Network:                   config.Network,
+		MTU:                       config.MTU,
+		KeepAliveTimeoutSec:       int(config.KeepAliveTimeout / time.Second),
+		ReconnectDelaySec:         int(config.ReconnectDelay / time.Second),
+		MaxConnections:            config.MaxConnections,
+		SessionTimeoutSec:         int(config.SessionTimeout / time.Second),
+		SessionCleanupIntervalSec: int(config.SessionCleanupInterval / time.Second),
+		ServerIP:                  config.ServerIP,
+		ClientIPStart:             config.ClientIPStart,
+		ClientIPEnd:               config.ClientIPEnd,
+		DNSServers:                config.DNSServers,
+		PushRoutes:                config.PushRoutes,
+	}
+	
+	data, err := json.MarshalIndent(configFile, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化配置失败: %v", err)
+	}
+	
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		return fmt.Errorf("保存配置文件失败: %v", err)
+	}
+	
+	return nil
 }
 
 // 默认配置
@@ -309,8 +409,139 @@ func pemEncode(blockType string, data []byte) []byte {
 	})
 }
 
+// CertificatesExist 检查证书文件是否存在
+func CertificatesExist(certDir string) bool {
+	files := []string{
+		certDir + "/ca.pem",
+		certDir + "/server.pem",
+		certDir + "/server-key.pem",
+		certDir + "/client.pem",
+		certDir + "/client-key.pem",
+	}
+	
+	for _, file := range files {
+		if _, err := os.Stat(file); os.IsNotExist(err) {
+			return false
+		}
+	}
+	return true
+}
+
+// SaveCertificates 保存证书到文件
+func SaveCertificates(certDir string, caCertPEM, serverCertPEM, serverKeyPEM, clientCertPEM, clientKeyPEM []byte) error {
+	// 创建证书目录
+	if err := os.MkdirAll(certDir, 0755); err != nil {
+		return fmt.Errorf("创建证书目录失败: %v", err)
+	}
+	
+	// 保存CA证书 (0644)
+	if err := os.WriteFile(certDir+"/ca.pem", caCertPEM, 0644); err != nil {
+		return fmt.Errorf("保存CA证书失败: %v", err)
+	}
+	
+	// 保存服务器证书 (0644)
+	if err := os.WriteFile(certDir+"/server.pem", serverCertPEM, 0644); err != nil {
+		return fmt.Errorf("保存服务器证书失败: %v", err)
+	}
+	
+	// 保存服务器私钥 (0600)
+	if err := os.WriteFile(certDir+"/server-key.pem", serverKeyPEM, 0600); err != nil {
+		return fmt.Errorf("保存服务器私钥失败: %v", err)
+	}
+	
+	// 保存客户端证书 (0644)
+	if err := os.WriteFile(certDir+"/client.pem", clientCertPEM, 0644); err != nil {
+		return fmt.Errorf("保存客户端证书失败: %v", err)
+	}
+	
+	// 保存客户端私钥 (0600)
+	if err := os.WriteFile(certDir+"/client-key.pem", clientKeyPEM, 0600); err != nil {
+		return fmt.Errorf("保存客户端私钥失败: %v", err)
+	}
+	
+	return nil
+}
+
+// LoadCertificateManagerFromFiles 从文件加载证书
+func LoadCertificateManagerFromFiles(certDir string) (*CertificateManager, error) {
+	// 读取CA证书
+	caCertPEM, err := os.ReadFile(certDir + "/ca.pem")
+	if err != nil {
+		return nil, fmt.Errorf("读取CA证书失败: %v", err)
+	}
+	
+	// 解析CA证书
+	block, _ := pem.Decode(caCertPEM)
+	if block == nil {
+		return nil, fmt.Errorf("解码CA证书失败")
+	}
+	caCert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("解析CA证书失败: %v", err)
+	}
+	
+	// 读取服务器证书和私钥
+	serverCertPEM, err := os.ReadFile(certDir + "/server.pem")
+	if err != nil {
+		return nil, fmt.Errorf("读取服务器证书失败: %v", err)
+	}
+	serverKeyPEM, err := os.ReadFile(certDir + "/server-key.pem")
+	if err != nil {
+		return nil, fmt.Errorf("读取服务器私钥失败: %v", err)
+	}
+	
+	// 读取客户端证书和私钥
+	clientCertPEM, err := os.ReadFile(certDir + "/client.pem")
+	if err != nil {
+		return nil, fmt.Errorf("读取客户端证书失败: %v", err)
+	}
+	clientKeyPEM, err := os.ReadFile(certDir + "/client-key.pem")
+	if err != nil {
+		return nil, fmt.Errorf("读取客户端私钥失败: %v", err)
+	}
+	
+	// 创建服务器证书对
+	serverCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("加载服务器证书失败: %v", err)
+	}
+	
+	serverCAPool := x509.NewCertPool()
+	serverCAPool.AppendCertsFromPEM(caCertPEM)
+	
+	// 创建客户端证书对
+	clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("加载客户端证书失败: %v", err)
+	}
+	
+	clientCAPool := x509.NewCertPool()
+	clientCAPool.AppendCertsFromPEM(caCertPEM)
+	
+	return &CertificateManager{
+		ServerCert: CertificatePair{
+			Certificate: serverCert,
+			CAPool:      serverCAPool,
+		},
+		ClientCert: CertificatePair{
+			Certificate: clientCert,
+			CAPool:      clientCAPool,
+		},
+		caCert: caCert,
+	}, nil
+}
+
 // NewCertificateManager 创建证书管理器
 func NewCertificateManager() (*CertificateManager, error) {
+	// 检查证书文件是否存在
+	if CertificatesExist(DefaultCertDir) {
+		log.Printf("从 %s 目录加载已有证书", DefaultCertDir)
+		return LoadCertificateManagerFromFiles(DefaultCertDir)
+	}
+	
+	// 证书不存在，生成新证书
+	log.Println("证书文件不存在，生成新证书...")
+	
 	// 首先生成CA证书
 	caCertPEM, _, caCert, caKey, err := generateCACertificate()
 	if err != nil {
@@ -328,6 +559,12 @@ func NewCertificateManager() (*CertificateManager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("生成客户端证书失败: %v", err)
 	}
+	
+	// 保存证书到文件
+	if err := SaveCertificates(DefaultCertDir, caCertPEM, serverCertPEM, serverKeyPEM, clientCertPEM, clientKeyPEM); err != nil {
+		return nil, fmt.Errorf("保存证书失败: %v", err)
+	}
+	log.Printf("证书已生成并保存到 %s 目录", DefaultCertDir)
 
 	// 创建服务器证书对
 	serverCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
@@ -1681,6 +1918,22 @@ func cleanupTUNDevice(ifaceName string) {
 }
 
 func main() {
+	// 加载配置
+	config := DefaultConfig
+	if _, err := os.Stat(DefaultConfigFile); err == nil {
+		log.Printf("从配置文件加载配置: %s", DefaultConfigFile)
+		loadedConfig, err := LoadConfigFromFile(DefaultConfigFile)
+		if err != nil {
+			log.Printf("警告: 加载配置文件失败，使用默认配置: %v", err)
+		} else {
+			config = loadedConfig
+			log.Println("配置文件加载成功")
+		}
+	} else {
+		log.Printf("配置文件不存在，使用默认配置")
+		log.Printf("提示: 可以创建 %s 文件来自定义配置", DefaultConfigFile)
+	}
+	
 	// 生成证书管理器
 	log.Println("初始化证书管理器...")
 	certManager, err := NewCertificateManager()
@@ -1690,9 +1943,10 @@ func main() {
 
 	// 检查命令行参数
 	if len(os.Args) < 2 {
-		log.Println("用法: go run main.go [server|client]")
-		log.Println("  server - 启动VPN服务器")
-		log.Println("  client - 启动VPN客户端")
+		log.Println("用法: ./vpn [server|client|generate-config]")
+		log.Println("  server          - 启动VPN服务器")
+		log.Println("  client          - 启动VPN客户端")
+		log.Println("  generate-config - 生成示例配置文件")
 		return
 	}
 
@@ -1701,9 +1955,19 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	switch os.Args[1] {
+	case "generate-config":
+		// 生成示例配置文件
+		if err := SaveConfigToFile(DefaultConfigFile, DefaultConfig); err != nil {
+			log.Fatalf("生成配置文件失败: %v", err)
+		}
+		log.Printf("示例配置文件已生成: %s", DefaultConfigFile)
+		log.Println("请根据需要修改配置文件后重新运行程序")
+		return
+		
 	case "server":
 		// 启动VPN服务器
-		server, err := NewVPNServer(":8080", certManager, DefaultConfig)
+		serverAddr := fmt.Sprintf(":%d", config.ServerPort)
+		server, err := NewVPNServer(serverAddr, certManager, config)
 		if err != nil {
 			log.Fatalf("创建VPN服务器失败: %v", err)
 		}
@@ -1712,6 +1976,16 @@ func main() {
 		if err := server.InitializeTUN(); err != nil {
 			log.Fatalf("初始化TUN设备失败: %v", err)
 		}
+		
+		// 显示证书复制提示
+		log.Println("")
+		log.Println("========================================")
+		log.Println("请将以下文件复制到客户端的 ./certs 目录：")
+		log.Println("  - ca.pem")
+		log.Println("  - client.pem")
+		log.Println("  - client-key.pem")
+		log.Println("========================================")
+		log.Println("")
 
 		// 在协程中启动服务器
 		go server.Start()
@@ -1723,7 +1997,7 @@ func main() {
 
 	case "client":
 		// 启动VPN客户端
-		client := NewVPNClient(certManager, DefaultConfig)
+		client := NewVPNClient(certManager, config)
 		
 		// 初始化TUN设备
 		if err := client.InitializeTUN(); err != nil {
@@ -1739,6 +2013,6 @@ func main() {
 		client.Close()
 
 	default:
-		log.Println("未知参数，使用 'server' 或 'client'")
+		log.Println("未知参数，使用 'server'、'client' 或 'generate-config'")
 	}
 }
