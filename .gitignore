@@ -30,3 +30,6 @@ Thumbs.db
 
 # Temporary files
 /tmp/
+
+# Certificate directory (contains sensitive keys)
+certs/
